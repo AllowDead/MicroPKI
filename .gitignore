@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+.env
+
+# Артефакты сборки
+micropki.egg-info/
+dist/
+build/
+
+# PKI Артефакты
+pki/
+*.pem
+*.key
+*.cert
+
+# Конфиденциальные данные и логи
+secrets/
+logs/
+
+# IDE
+.idea/
+.vscode/
