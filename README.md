@@ -259,5 +259,134 @@ run_tests.py
 run_tests.bat
 run_tests.sh
 README.md
-COMPLIANCE_REPORT.md
 ```
+
+## Sprint 3: база сертификатов SQLite
+
+Инициализация базы сертификатов:
+
+```bash
+micropki db init --db-path ./pki/micropki.db
+```
+
+Команда идемпотентна: повторный запуск не ломает существующую схему. База содержит таблицу `certificates`, уникальный индекс по `serial_hex`, индекс по `status` и служебную таблицу `schema_migrations` для простой подготовки к будущим миграциям.
+
+Начиная со Sprint 3, команды `ca init`, `ca issue-intermediate` и `ca issue-cert` поддерживают `--db-path`. По умолчанию используется `./pki/micropki.db`. Новые сертификаты автоматически заносятся в базу после выпуска.
+
+Пример полного начала работы:
+
+```bash
+mkdir -p secrets
+printf "root-passphrase\n" > secrets/root.pass
+printf "intermediate-passphrase\n" > secrets/intermediate.pass
+
+micropki db init --db-path ./pki/micropki.db
+
+micropki ca init \
+  --subject "CN=Demo Root CA,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 4096 \
+  --passphrase-file ./secrets/root.pass \
+  --out-dir ./pki \
+  --db-path ./pki/micropki.db \
+  --force
+
+micropki ca issue-intermediate \
+  --root-cert ./pki/certs/ca.cert.pem \
+  --root-key ./pki/private/ca.key.pem \
+  --root-pass-file ./secrets/root.pass \
+  --subject "CN=MicroPKI Intermediate CA,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 4096 \
+  --passphrase-file ./secrets/intermediate.pass \
+  --out-dir ./pki \
+  --db-path ./pki/micropki.db
+
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --subject "CN=example.com,O=MicroPKI" \
+  --san dns:example.com \
+  --san ip:127.0.0.1 \
+  --out-dir ./pki/certs \
+  --db-path ./pki/micropki.db
+```
+
+## Sprint 3: просмотр сертификатов из базы
+
+Список сертификатов:
+
+```bash
+micropki ca list-certs --db-path ./pki/micropki.db --format table
+micropki ca list-certs --db-path ./pki/micropki.db --status valid --format json
+micropki ca list-certs --db-path ./pki/micropki.db --format csv
+```
+
+Вывод PEM по серийному номеру:
+
+```bash
+micropki ca show-cert 2A7F --db-path ./pki/micropki.db > cert.pem
+```
+
+## Sprint 3: HTTP repository server
+
+Запуск сервера репозитория:
+
+```bash
+micropki repo serve \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --db-path ./pki/micropki.db \
+  --cert-dir ./pki/certs \
+  --log-file ./logs/repo.log
+```
+
+Проверка порта сервера:
+
+```bash
+micropki repo status --host 127.0.0.1 --port 8080
+```
+
+Примеры API-запросов:
+
+```bash
+curl http://127.0.0.1:8080/certificate/2A7F --output cert.pem
+curl http://127.0.0.1:8080/ca/root --output root.pem
+curl http://127.0.0.1:8080/ca/intermediate --output intermediate.pem
+curl -i http://127.0.0.1:8080/crl
+```
+
+Эндпоинты:
+
+```text
+GET /certificate/<serial>   # PEM сертификата из SQLite, 400 для не-hex serial, 404 если не найден
+GET /ca/root                # pki/certs/ca.cert.pem
+GET /ca/intermediate        # pki/certs/intermediate.cert.pem
+GET /crl                    # 501, заглушка под Sprint 4
+```
+
+Все ответы HTTP включают `Access-Control-Allow-Origin: *`. Каждый запрос логируется в формате с префиксом `[HTTP]`, методом, путём, IP клиента и статусом ответа.
+
+## Sprint 3: дополнительные проверки
+
+Проверка генератора serial:
+
+```bash
+python scripts/serial_stress.py --db-path ./pki/micropki.db --count 100
+```
+
+Полный интеграционный workflow Sprint 3:
+
+```bash
+python scripts/integration_sprint3.py
+```
+
+Тесты:
+
+```bash
+python run_tests.py
+```
+
+На текущей версии тестовый набор покрывает SQLite-схему, уникальность serial, автоматическую вставку сертификатов, CLI `list-certs`/`show-cert`, HTTP API `/certificate/<serial>`, `/ca/root`, `/ca/intermediate`, `/crl`, CORS и негативную проверку невалидного serial.

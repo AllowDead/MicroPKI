@@ -53,7 +53,7 @@ def _authority_key_identifier_from_cert(issuer_cert):
         return x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_cert.public_key())
 
 
-def build_ca_certificate(subject_name, private_key, validity_days):
+def build_ca_certificate(subject_name, private_key, validity_days, serial_number=None):
     public_key = private_key.public_key()
     subject = subject_name
     issuer = subject_name
@@ -63,7 +63,7 @@ def build_ca_certificate(subject_name, private_key, validity_days):
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(issuer)
     builder = builder.public_key(public_key)
-    builder = builder.serial_number(_random_positive_serial_number())
+    builder = builder.serial_number(serial_number or _random_positive_serial_number())
     builder = builder.not_valid_before(utc_now)
     builder = builder.not_valid_after(utc_now + datetime.timedelta(days=validity_days))
 
@@ -95,7 +95,7 @@ def build_ca_certificate(subject_name, private_key, validity_days):
     return builder.sign(private_key, _signing_hash_for_key(private_key))
 
 
-def build_intermediate_certificate(csr, root_cert, root_private_key, validity_days, pathlen=0):
+def build_intermediate_certificate(csr, root_cert, root_private_key, validity_days, pathlen=0, serial_number=None):
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     public_key = csr.public_key()
 
@@ -103,7 +103,7 @@ def build_intermediate_certificate(csr, root_cert, root_private_key, validity_da
     builder = builder.subject_name(csr.subject)
     builder = builder.issuer_name(root_cert.subject)
     builder = builder.public_key(public_key)
-    builder = builder.serial_number(_random_positive_serial_number())
+    builder = builder.serial_number(serial_number or _random_positive_serial_number())
     builder = builder.not_valid_before(utc_now)
     builder = builder.not_valid_after(utc_now + datetime.timedelta(days=validity_days))
     builder = builder.add_extension(
@@ -156,7 +156,7 @@ def _key_usage_for_template(template, public_key):
     )
 
 
-def build_end_entity_certificate(subject, public_key, issuer_cert, issuer_private_key, template, san_names, validity_days):
+def build_end_entity_certificate(subject, public_key, issuer_cert, issuer_private_key, template, san_names, validity_days, serial_number=None):
     from .templates import eku_for_template
 
     utc_now = datetime.datetime.now(datetime.timezone.utc)
@@ -164,7 +164,7 @@ def build_end_entity_certificate(subject, public_key, issuer_cert, issuer_privat
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(issuer_cert.subject)
     builder = builder.public_key(public_key)
-    builder = builder.serial_number(_random_positive_serial_number())
+    builder = builder.serial_number(serial_number or _random_positive_serial_number())
     builder = builder.not_valid_before(utc_now)
     builder = builder.not_valid_after(utc_now + datetime.timedelta(days=validity_days))
     builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)

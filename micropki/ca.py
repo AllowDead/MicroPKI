@@ -45,6 +45,31 @@ def _safe_basename_from_subject(subject):
     return safe or "certificate"
 
 
+def _infer_db_path_from_out_dir(out_dir):
+    out_dir = os.path.abspath(out_dir)
+    if os.path.basename(out_dir).lower() == "certs":
+        pki_root = os.path.dirname(out_dir)
+    else:
+        pki_root = out_dir
+    return os.path.join(pki_root, "micropki.db")
+
+
+def _db_path_for_args(args):
+    value = getattr(args, "db_path", None)
+    if value:
+        return os.path.abspath(value)
+    return _infer_db_path_from_out_dir(getattr(args, "out_dir", "./pki"))
+
+
+def _cleanup_paths(paths):
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def init_ca(args, logger):
     subject_name = args.subject
     key_type = args.key_type
@@ -86,7 +111,11 @@ def init_ca(args, logger):
     logger.info("Начало подписания сертификата УЦ...")
     try:
         dn = parse_dn(subject_name)
-        cert = build_ca_certificate(dn, private_key, validity_days)
+        serial_number = None
+        if getattr(args, "db_path", None):
+            from .serial import generate_unique_serial
+            serial_number = generate_unique_serial(args.db_path)
+        cert = build_ca_certificate(dn, private_key, validity_days, serial_number=serial_number)
     except ValueError as exc:
         logger.error(f"Ошибка формирования сертификата: {exc}")
         raise SystemExit(1)
@@ -98,22 +127,10 @@ def init_ca(args, logger):
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.BestAvailableEncryption(passphrase),
     )
-    try:
-        _write_private_key_securely(key_path, key_pem)
-    except OSError as exc:
-        logger.error(f"Не удалось сохранить закрытый ключ: {exc}")
-        raise SystemExit(1)
+    cert_pem = serialize_cert_to_pem(cert)
 
     if os.name == "nt":
         logger.warning("ОС Windows: невозможно гарантировать POSIX-права 0o600/0o700 для ключевого файла.")
-
-    logger.info(f"Сохранение сертификата в {cert_path}...")
-    cert_pem = serialize_cert_to_pem(cert)
-    try:
-        _write_file(cert_path, cert_pem, binary=True)
-    except OSError as exc:
-        logger.error(f"Не удалось сохранить сертификат: {exc}")
-        raise SystemExit(1)
 
     logger.info(f"Генерация policy.txt: {policy_path}")
     not_before = cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -133,10 +150,32 @@ def init_ca(args, logger):
 
 Описание: Корневой УЦ для демонстрации MicroPKI.
 """
+    created_paths = []
     try:
-        _write_file(policy_path, policy_content, binary=False)
-    except OSError as exc:
-        logger.error(f"Не удалось сохранить policy.txt: {exc}")
+        db_path = getattr(args, "db_path", None)
+        if db_path:
+            from .database import certificate_insertion_transaction, certificate_to_record
+            record = certificate_to_record(cert)
+            with certificate_insertion_transaction(db_path, record):
+                _write_private_key_securely(key_path, key_pem)
+                created_paths.append(key_path)
+                logger.info(f"Сохранение сертификата в {cert_path}...")
+                _write_file(cert_path, cert_pem, binary=True)
+                created_paths.append(cert_path)
+                _write_file(policy_path, policy_content, binary=False)
+                created_paths.append(policy_path)
+            logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
+        else:
+            _write_private_key_securely(key_path, key_pem)
+            created_paths.append(key_path)
+            logger.info(f"Сохранение сертификата в {cert_path}...")
+            _write_file(cert_path, cert_pem, binary=True)
+            created_paths.append(cert_path)
+            _write_file(policy_path, policy_content, binary=False)
+            created_paths.append(policy_path)
+    except Exception as exc:
+        _cleanup_paths(created_paths)
+        logger.error(f"Не удалось сохранить файлы Root CA или запись БД: {exc}")
         raise SystemExit(1)
 
     logger.info("Инициализация УЦ успешно завершена.")
@@ -205,8 +244,11 @@ def issue_intermediate(args, logger):
     )
     from .crypto_utils import name_to_string, parse_dn
     from .csr import generate_intermediate_csr, serialize_csr_to_pem, verify_csr_signature
+    from .database import certificate_insertion_transaction, certificate_to_record
+    from .serial import generate_unique_serial
 
     out_dir = os.path.abspath(args.out_dir)
+    db_path = _db_path_for_args(args)
     private_dir = os.path.join(out_dir, "private")
     certs_dir = os.path.join(out_dir, "certs")
     csrs_dir = os.path.join(out_dir, "csrs")
@@ -232,7 +274,15 @@ def issue_intermediate(args, logger):
         logger.info("Generation of Intermediate CA CSR completed.")
 
         logger.info("Signing of Intermediate CA certificate by Root CA started.")
-        cert = build_intermediate_certificate(csr, root_cert, root_key, args.validity_days, args.pathlen)
+        serial_number = generate_unique_serial(db_path)
+        cert = build_intermediate_certificate(
+            csr,
+            root_cert,
+            root_key,
+            args.validity_days,
+            args.pathlen,
+            serial_number=serial_number,
+        )
         logger.info("Signing of Intermediate CA certificate by Root CA completed.")
     except Exception as exc:
         logger.error(f"Ошибка выпуска Intermediate CA: {exc}")
@@ -248,13 +298,8 @@ def issue_intermediate(args, logger):
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.BestAvailableEncryption(args.passphrase_bytes),
     )
-    try:
-        _write_private_key_securely(key_path, key_pem)
-        _write_file(cert_path, serialize_cert_to_pem(cert), binary=True)
-        _write_file(csr_path, serialize_csr_to_pem(csr), binary=True)
-    except OSError as exc:
-        logger.error(f"Не удалось сохранить файлы Intermediate CA: {exc}")
-        raise SystemExit(1)
+    cert_pem = serialize_cert_to_pem(cert)
+    csr_pem = serialize_csr_to_pem(csr)
 
     algo_str = f"RSA-{args.key_size}" if args.key_type == "rsa" else "ECC-P384"
     section = f"""
@@ -269,19 +314,30 @@ Key Algorithm and Size: {algo_str}
 Path Length Constraint: {args.pathlen}
 Issuer DN: {name_to_string(root_cert.subject)}
 """
+
+    record = certificate_to_record(cert)
+    created_paths = []
     try:
-        with open(policy_path, "a", encoding="utf-8") as f:
-            f.write(section)
-    except OSError as exc:
-        logger.error(f"Не удалось обновить policy.txt: {exc}")
+        with certificate_insertion_transaction(db_path, record):
+            _write_private_key_securely(key_path, key_pem)
+            created_paths.append(key_path)
+            _write_file(cert_path, cert_pem, binary=True)
+            created_paths.append(cert_path)
+            _write_file(csr_path, csr_pem, binary=True)
+            created_paths.append(csr_path)
+            with open(policy_path, "a", encoding="utf-8") as f:
+                f.write(section)
+    except Exception as exc:
+        _cleanup_paths(created_paths)
+        logger.error(f"Не удалось сохранить файлы Intermediate CA или запись БД: {exc}")
         raise SystemExit(1)
 
+    logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
     logger.info(f"Intermediate CA key saved: {os.path.abspath(key_path)}")
     logger.info(f"Intermediate CA certificate saved: {os.path.abspath(cert_path)}")
     logger.info(f"Intermediate CA CSR saved: {os.path.abspath(csr_path)}")
     print(f"Intermediate CA certificate: {cert_path}")
     print(f"Intermediate CA key: {key_path}")
-
 
 def issue_cert(args, logger):
     from .certificates import (
@@ -293,9 +349,12 @@ def issue_cert(args, logger):
     )
     from .crypto_utils import name_to_string, parse_dn
     from .csr import load_csr_pem, verify_csr_signature
+    from .database import certificate_insertion_transaction, certificate_to_record
+    from .serial import generate_unique_serial
     from .templates import parse_san_entries, validate_template_sans
 
     os.makedirs(args.out_dir, exist_ok=True)
+    db_path = _db_path_for_args(args)
     try:
         ca_cert = load_certificate(args.ca_cert)
         ca_key = load_private_key(args.ca_key, args.ca_passphrase_bytes)
@@ -324,6 +383,7 @@ def issue_cert(args, logger):
             private_key = generate_end_entity_key("rsa", 2048)
             public_key = private_key.public_key()
 
+        serial_number = generate_unique_serial(db_path)
         cert = build_end_entity_certificate(
             subject=subject,
             public_key=public_key,
@@ -332,6 +392,7 @@ def issue_cert(args, logger):
             template=args.template,
             san_names=san_names,
             validity_days=args.validity_days,
+            serial_number=serial_number,
         )
     except Exception as exc:
         logger.error(f"Ошибка выпуска конечного сертификата: {exc}")
@@ -340,23 +401,31 @@ def issue_cert(args, logger):
     base = _safe_basename_from_subject(subject)
     cert_path = os.path.join(args.out_dir, f"{base}.cert.pem")
     key_path = os.path.join(args.out_dir, f"{base}.key.pem")
+    cert_pem = serialize_cert_to_pem(cert)
+    record = certificate_to_record(cert)
+    created_paths = []
 
     try:
-        _write_file(cert_path, serialize_cert_to_pem(cert), binary=True)
-        if private_key is not None:
-            key_pem = private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            _write_private_key_securely(key_path, key_pem)
-            logger.warning(f"End-entity private key is stored unencrypted: {os.path.abspath(key_path)}")
-    except OSError as exc:
-        logger.error(f"Не удалось сохранить конечный сертификат или ключ: {exc}")
+        with certificate_insertion_transaction(db_path, record):
+            _write_file(cert_path, cert_pem, binary=True)
+            created_paths.append(cert_path)
+            if private_key is not None:
+                key_pem = private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+                _write_private_key_securely(key_path, key_pem)
+                created_paths.append(key_path)
+                logger.warning(f"End-entity private key is stored unencrypted: {os.path.abspath(key_path)}")
+    except Exception as exc:
+        _cleanup_paths(created_paths)
+        logger.error(f"Не удалось сохранить конечный сертификат/ключ или запись БД: {exc}")
         raise SystemExit(1)
 
     san_text = ",".join(args.san or [])
     issued_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
     logger.info(
         f"Successful issuance of an end-entity certificate: template={args.template}, "
         f"subject={name_to_string(subject)}, SANs={san_text}, serial={hex(cert.serial_number)}, issued_at={issued_at}"
@@ -364,7 +433,6 @@ def issue_cert(args, logger):
     print(f"Certificate: {cert_path}")
     if private_key is not None:
         print(f"Private key: {key_path}")
-
 
 def verify_chain(args, logger):
     from .certificates import load_certificate
