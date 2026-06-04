@@ -520,3 +520,138 @@ openssl crl \
 Ожидаемый результат OpenSSL: `verify OK`.
 
 Полный жизненный цикл в тестах покрывает выпуск leaf-сертификата, отзыв с причиной `keyCompromise`, обновление полей `status`, `revocation_reason`, `revocation_date`, генерацию CRL, наличие serial в CRL, увеличение CRL Number, HTTP-раздачу CRL и негативные сценарии для отсутствующего/уже отозванного сертификата.
+
+## Sprint 5: выпуск OCSP responder certificate
+
+OCSP responder certificate — специальный конечный сертификат для подписи OCSP-ответов. Он выпускается от Intermediate CA, содержит `BasicConstraints: CA=FALSE`, `KeyUsage: digitalSignature` и `ExtendedKeyUsage: OCSPSigning`.
+
+```bash
+micropki ca issue-ocsp-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --subject "CN=OCSP Responder,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 2048 \
+  --san dns:ocsp.example.com \
+  --out-dir ./pki/certs \
+  --validity-days 365
+```
+
+Команда создаёт:
+
+```text
+pki/certs/ocsp.cert.pem
+pki/certs/ocsp.key.pem
+pki/ocsp/
+```
+
+Приватный ключ OCSP responder хранится незашифрованным PEM с правами `0o600`, потому что responder должен загружать его автоматически при старте. Утилита выводит предупреждение об этом в лог.
+
+## Sprint 5: запуск OCSP responder
+
+```bash
+micropki ocsp serve \
+  --host 127.0.0.1 \
+  --port 8081 \
+  --db-path ./pki/micropki.db \
+  --responder-cert ./pki/certs/ocsp.cert.pem \
+  --responder-key ./pki/certs/ocsp.key.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --cache-ttl 120 \
+  --log-file ./logs/ocsp.log
+```
+
+Responder принимает DER-кодированные OCSP-запросы через HTTP POST на `/ocsp` или `/` с заголовком:
+
+```text
+Content-Type: application/ocsp-request
+```
+
+Ответ возвращается с:
+
+```text
+Content-Type: application/ocsp-response
+```
+
+Responder определяет статус по SQLite-базе:
+
+```text
+valid   -> good
+revoked -> revoked
+missing / wrong issuer -> unknown
+```
+
+Каждый OCSP-запрос логируется в структурированном JSON-подобном формате: client IP, serial, статус ответа, совпадение issuer и время обработки в миллисекундах.
+
+## Sprint 5: проверка через OpenSSL ocsp
+
+Good status:
+
+```bash
+openssl ocsp \
+  -issuer ./pki/certs/intermediate.cert.pem \
+  -cert ./pki/certs/example.com.cert.pem \
+  -url http://127.0.0.1:8081/ocsp \
+  -VAfile ./pki/certs/ocsp.cert.pem \
+  -CAfile ./pki/certs/intermediate.cert.pem \
+  -partial_chain \
+  -no_nonce
+```
+
+Ожидаемый результат:
+
+```text
+Response verify OK
+./pki/certs/example.com.cert.pem: good
+```
+
+Revoked status:
+
+```bash
+micropki ca revoke <SERIAL> --reason keyCompromise --force --db-path ./pki/micropki.db
+
+openssl ocsp \
+  -issuer ./pki/certs/intermediate.cert.pem \
+  -cert ./pki/certs/example.com.cert.pem \
+  -url http://127.0.0.1:8081/ocsp \
+  -VAfile ./pki/certs/ocsp.cert.pem \
+  -CAfile ./pki/certs/intermediate.cert.pem \
+  -partial_chain \
+  -no_nonce
+```
+
+## Sprint 5: OCSP nonce и replay protection
+
+OCSP nonce — расширение запроса с OID `1.3.6.1.5.5.7.48.1.2`. Клиент добавляет случайное значение в запрос, а responder обязан вернуть точно такое же значение в ответе. Это помогает обнаруживать повторно отправленные старые OCSP-ответы.
+
+В MicroPKI responder работает так:
+
+```text
+request has nonce    -> response echoes the same nonce
+request has no nonce -> response has no nonce extension
+```
+
+OpenSSL-запрос с nonce:
+
+```bash
+openssl ocsp \
+  -issuer ./pki/certs/intermediate.cert.pem \
+  -cert ./pki/certs/example.com.cert.pem \
+  -url http://127.0.0.1:8081/ocsp \
+  -VAfile ./pki/certs/ocsp.cert.pem \
+  -CAfile ./pki/certs/intermediate.cert.pem \
+  -partial_chain \
+  -nonce
+```
+
+## Sprint 5: структура проекта
+
+```text
+micropki/
+  ocsp.py
+  ocsp_responder.py
+```
+
+`ocsp.py` содержит разбор OCSP request, построение signed OCSP response, nonce handling, status determination и проверку OCSP signer certificate.  
+`ocsp_responder.py` содержит HTTP-server для `micropki ocsp serve`.

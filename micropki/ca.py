@@ -438,6 +438,82 @@ def issue_cert(args, logger):
     if private_key is not None:
         print(f"Private key: {key_path}")
 
+
+def issue_ocsp_cert(args, logger):
+    from .certificates import (
+        build_ocsp_responder_certificate,
+        generate_end_entity_key,
+        load_certificate,
+        load_private_key,
+        serialize_cert_to_pem,
+    )
+    from .crypto_utils import name_to_string, parse_dn
+    from .database import certificate_insertion_transaction, certificate_to_record
+    from .serial import generate_unique_serial
+    from .templates import parse_san_entries
+
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    ocsp_dir = os.path.abspath(os.path.join(os.path.dirname(out_dir), "ocsp"))
+    os.makedirs(ocsp_dir, exist_ok=True)
+    db_path = _db_path_for_args(args)
+
+    try:
+        ca_cert = load_certificate(args.ca_cert)
+        ca_key = load_private_key(args.ca_key, args.ca_passphrase_bytes)
+    except Exception as exc:
+        logger.error(f"Не удалось загрузить CA сертификат или ключ для OCSP: {exc}")
+        raise SystemExit(1)
+
+    try:
+        subject = parse_dn(args.subject)
+        san_names = parse_san_entries(args.san or [])
+        private_key = generate_end_entity_key(args.key_type, args.key_size)
+        serial_number = generate_unique_serial(db_path)
+        cert = build_ocsp_responder_certificate(
+            subject=subject,
+            public_key=private_key.public_key(),
+            issuer_cert=ca_cert,
+            issuer_private_key=ca_key,
+            san_names=san_names,
+            validity_days=args.validity_days,
+            serial_number=serial_number,
+        )
+    except Exception as exc:
+        logger.error(f"Ошибка выпуска OCSP responder certificate: {exc}")
+        raise SystemExit(1)
+
+    cert_path = os.path.join(out_dir, "ocsp.cert.pem")
+    key_path = os.path.join(out_dir, "ocsp.key.pem")
+    cert_pem = serialize_cert_to_pem(cert)
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    record = certificate_to_record(cert)
+    created_paths = []
+    try:
+        with certificate_insertion_transaction(db_path, record):
+            _write_file(cert_path, cert_pem, binary=True)
+            created_paths.append(cert_path)
+            _write_private_key_securely(key_path, key_pem)
+            created_paths.append(key_path)
+    except Exception as exc:
+        _cleanup_paths(created_paths)
+        logger.error(f"Не удалось сохранить OCSP certificate/key или запись БД: {exc}")
+        raise SystemExit(1)
+
+    logger.warning(f"OCSP responder private key is stored unencrypted: {os.path.abspath(key_path)}")
+    logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
+    logger.info(
+        f"Successful issuance of an OCSP responder certificate: subject={name_to_string(subject)}, "
+        f"SANs={','.join(args.san or [])}, serial={hex(cert.serial_number)}"
+    )
+    print(f"OCSP certificate: {cert_path}")
+    print(f"OCSP private key: {key_path}")
+
+
 def verify_chain(args, logger):
     from .certificates import load_certificate
     from .chain import validate_chain

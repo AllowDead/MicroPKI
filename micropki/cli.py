@@ -243,6 +243,65 @@ def _resolve_ca_defaults(ca, out_dir):
         )
     return (ca_value, None, os.path.splitext(os.path.basename(ca_value))[0] or "ca")
 
+
+def validate_issue_ocsp_cert_args(args, logger):
+    errors = []
+    for path, name in [
+        (args.ca_cert, "--ca-cert"),
+        (args.ca_key, "--ca-key"),
+        (args.ca_pass_file, "--ca-pass-file"),
+    ]:
+        _validate_existing_readable_file(path, name, errors)
+    if not args.subject or not args.subject.strip():
+        errors.append("Должен быть указан непустой --subject.")
+    else:
+        try:
+            from .crypto_utils import parse_dn
+            parse_dn(args.subject)
+        except ValueError as exc:
+            errors.append(f"Некорректный --subject: {exc}")
+    if args.key_type not in ["rsa", "ecc"]:
+        errors.append("--key-type обязан быть 'rsa' или 'ecc'.")
+    if args.key_type == "rsa" and args.key_size < 2048:
+        errors.append("Для OCSP RSA --key-size должен быть не меньше 2048.")
+    if args.key_type == "ecc" and args.key_size < 256:
+        errors.append("Для OCSP ECC --key-size должен быть не меньше 256.")
+    try:
+        from .templates import parse_san_entries, san_types
+        names = parse_san_entries(args.san or [])
+        unsupported = san_types(names) - {"dns", "uri"}
+        if unsupported:
+            errors.append("OCSP responder certificate поддерживает только DNS или URI SAN.")
+    except ValueError as exc:
+        errors.append(str(exc))
+    _validate_validity_days(args.validity_days, "--validity-days", errors)
+    _validate_common_out_dir(args.out_dir, errors)
+    _validate_db_parent(getattr(args, "db_path", DEFAULT_DB_PATH), errors)
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+
+def validate_ocsp_serve_args(args, logger):
+    errors = []
+    for path, name in [
+        (args.responder_cert, "--responder-cert"),
+        (args.responder_key, "--responder-key"),
+        (args.ca_cert, "--ca-cert"),
+    ]:
+        _validate_existing_readable_file(path, name, errors)
+    _validate_db_parent(getattr(args, "db_path", DEFAULT_DB_PATH), errors)
+    if args.port < 1 or args.port > 65535:
+        errors.append("--port должен быть в диапазоне 1..65535")
+    if args.cache_ttl <= 0:
+        errors.append("--cache-ttl должен быть положительным целым числом")
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+
 def load_passphrase(path):
     with open(path, "rb") as f:
         passphrase = f.read()
@@ -327,6 +386,19 @@ def main():
     cert_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
     _add_db_path_arg(cert_parser)
 
+    ocsp_cert_parser = ca_subparsers.add_parser("issue-ocsp-cert", help="Issue an OCSP responder signing certificate")
+    ocsp_cert_parser.add_argument("--ca-cert", required=True, help="Path to Intermediate CA certificate PEM")
+    ocsp_cert_parser.add_argument("--ca-key", required=True, help="Path to Intermediate CA encrypted private key PEM")
+    ocsp_cert_parser.add_argument("--ca-pass-file", required=True, help="Path to Intermediate CA passphrase file")
+    ocsp_cert_parser.add_argument("--subject", required=True, help="OCSP responder Subject DN")
+    ocsp_cert_parser.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa", help="OCSP responder key type")
+    ocsp_cert_parser.add_argument("--key-size", type=int, default=2048, help="RSA >=2048 or ECC >=256")
+    ocsp_cert_parser.add_argument("--san", action="append", default=[], help="SAN entry for OCSP responder: dns:ocsp.example.com or uri:http://...")
+    ocsp_cert_parser.add_argument("--out-dir", default="./pki/certs", help="Output directory for OCSP cert/key")
+    ocsp_cert_parser.add_argument("--validity-days", type=int, default=365, help="OCSP responder validity period")
+    ocsp_cert_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+    _add_db_path_arg(ocsp_cert_parser)
+
     chain_parser = ca_subparsers.add_parser("verify-chain", help="Validate leaf -> intermediate -> root chain")
     chain_parser.add_argument("--root-cert", required=True, help="Root CA certificate PEM")
     chain_parser.add_argument("--intermediate-cert", required=True, help="Intermediate CA certificate PEM")
@@ -395,6 +467,18 @@ def main():
     status_parser.add_argument("--host", default="127.0.0.1", help="Host to check")
     status_parser.add_argument("--port", type=int, default=8080, help="Port to check")
 
+    ocsp_parser = subparsers.add_parser("ocsp", help="OCSP responder operations")
+    ocsp_subparsers = ocsp_parser.add_subparsers(dest="ocsp_command")
+    ocsp_serve_parser = ocsp_subparsers.add_parser("serve", help="Start the OCSP responder")
+    ocsp_serve_parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    ocsp_serve_parser.add_argument("--port", type=int, default=8081, help="TCP port")
+    _add_db_path_arg(ocsp_serve_parser)
+    ocsp_serve_parser.add_argument("--responder-cert", required=True, help="OCSP signing certificate PEM")
+    ocsp_serve_parser.add_argument("--responder-key", required=True, help="OCSP signing private key PEM, unencrypted")
+    ocsp_serve_parser.add_argument("--ca-cert", required=True, help="Issuer CA certificate PEM")
+    ocsp_serve_parser.add_argument("--cache-ttl", type=int, default=60, help="OCSP response cache TTL / nextUpdate seconds")
+    ocsp_serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
     args = parser.parse_args()
 
     if args.command == "ca" and args.ca_command == "init":
@@ -436,6 +520,15 @@ def main():
         validate_issue_cert_args(args, logger)
         args.ca_passphrase_bytes = load_passphrase(args.ca_pass_file)
         issue_cert(args, logger)
+        return
+
+    if args.command == "ca" and args.ca_command == "issue-ocsp-cert":
+        from .logger import setup_logger
+        from .ca import issue_ocsp_cert
+        logger = setup_logger(args.log_file)
+        validate_issue_ocsp_cert_args(args, logger)
+        args.ca_passphrase_bytes = load_passphrase(args.ca_pass_file)
+        issue_ocsp_cert(args, logger)
         return
 
     if args.command == "ca" and args.ca_command == "verify-chain":
@@ -568,6 +661,32 @@ def main():
         running = _check_repo_status(args.host, args.port)
         print("running" if running else "not running")
         sys.exit(0 if running else 1)
+
+    if args.command == "ocsp" and args.ocsp_command == "serve":
+        from .logger import setup_logger
+        from .ocsp_responder import serve_ocsp
+        logger = setup_logger(args.log_file)
+        validate_ocsp_serve_args(args, logger)
+        try:
+            serve_ocsp(
+                args.host,
+                args.port,
+                args.db_path,
+                args.responder_cert,
+                args.responder_key,
+                args.ca_cert,
+                args.cache_ttl,
+                logger,
+            )
+        except OSError as exc:
+            logger.error(f"OCSP responder failed: {exc}")
+            print(f"OCSP responder failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            logger.error(f"OCSP responder failed: {exc}")
+            print(f"OCSP responder failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     parser.print_help()
     sys.exit(1)

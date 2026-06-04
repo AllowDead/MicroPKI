@@ -3,7 +3,7 @@ import os
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
-from cryptography.x509.oid import ExtensionOID
+from cryptography.x509.oid import ExtensionOID, ExtendedKeyUsageOID
 
 
 def generate_key(key_type, key_size):
@@ -24,7 +24,11 @@ def generate_end_entity_key(key_type="rsa", key_size=2048):
             raise ValueError("Для конечного RSA-сертификата нужен ключ не меньше 2048 бит")
         return rsa.generate_private_key(public_exponent=65537, key_size=key_size)
     if key_type == "ecc":
-        return ec.generate_private_key(ec.SECP256R1())
+        if key_size >= 384:
+            return ec.generate_private_key(ec.SECP384R1())
+        if key_size >= 256:
+            return ec.generate_private_key(ec.SECP256R1())
+        raise ValueError("Для конечного ECC-сертификата нужен ключ не меньше P-256")
     raise ValueError(f"Неподдерживаемый тип ключа: {key_type}")
 
 
@@ -170,6 +174,47 @@ def build_end_entity_certificate(subject, public_key, issuer_cert, issuer_privat
     builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
     builder = builder.add_extension(_key_usage_for_template(template, public_key), critical=True)
     builder = builder.add_extension(eku_for_template(template), critical=False)
+    if san_names:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_names), critical=False)
+    ski = x509.SubjectKeyIdentifier.from_public_key(public_key)
+    builder = builder.add_extension(ski, critical=False)
+    builder = builder.add_extension(_authority_key_identifier_from_cert(issuer_cert), critical=False)
+    return builder.sign(issuer_private_key, _signing_hash_for_key(issuer_private_key))
+
+
+
+def build_ocsp_responder_certificate(subject, public_key, issuer_cert, issuer_private_key, san_names=None, validity_days=365, serial_number=None):
+    """Build an OCSP responder signing certificate.
+
+    Profile: CA=FALSE, KeyUsage=digitalSignature only, EKU=id-kp-OCSPSigning.
+    """
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    builder = x509.CertificateBuilder()
+    builder = builder.subject_name(subject)
+    builder = builder.issuer_name(issuer_cert.subject)
+    builder = builder.public_key(public_key)
+    builder = builder.serial_number(serial_number or _random_positive_serial_number())
+    builder = builder.not_valid_before(utc_now)
+    builder = builder.not_valid_after(utc_now + datetime.timedelta(days=validity_days))
+    builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    builder = builder.add_extension(
+        x509.KeyUsage(
+            digital_signature=True,
+            key_encipherment=False,
+            content_commitment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        ),
+        critical=True,
+    )
+    builder = builder.add_extension(
+        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]),
+        critical=False,
+    )
     if san_names:
         builder = builder.add_extension(x509.SubjectAlternativeName(san_names), critical=False)
     ski = x509.SubjectKeyIdentifier.from_public_key(public_key)
