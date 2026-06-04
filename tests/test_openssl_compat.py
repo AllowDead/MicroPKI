@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 import tempfile
 import pytest
 from cryptography import x509
@@ -11,6 +12,8 @@ from micropki.crypto_utils import parse_dn
 
 
 def test_openssl_structural_compatibility():
+    if shutil.which("openssl") is None:
+        pytest.skip("OpenSSL CLI is not installed or not available in PATH")
 
     subject_str = "CN=Demo Root CA"
     dn = parse_dn(subject_str)

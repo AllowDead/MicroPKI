@@ -1,14 +1,263 @@
-Инструкция по сборке и установке
-Клонируйте репозиторий.
-Создайте и активируйте виртуальное окружение:
-python -m venv venvsource venv/bin/activate  # Linux/Macvenv\Scripts\activate     # Windows
-Установите зависимости:
-pip install -r requirements.txt
-Установите пакет в режиме разработки (для доступа к команде micropki):
-pip install -e .
-Пример:
-MSYS_NO_PATHCONV=1 micropki ca init --subject "/CN=Demo Root CA" --key-type rsa --key-size 4096 --passphrase-file ./secrets/ca.pass --out-dir ./pki --validity-days 7300 --log-file ./logs/ca-init.log
-Тестирование:
-openssl x509 -in ./pki/certs/ca.cert.pem -text -noout
-openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/ca.cert.pem
-pytest tests/ -v
+# MicroPKI
+
+MicroPKI — учебная CLI-утилита для создания Root CA, Intermediate CA и выпуска конечных X.509-сертификатов по шаблонам `server`, `client`, `code_signing`.
+
+## Требования
+
+- Python 3.8+
+- `cryptography>=41.0.0`
+- `pytest>=7.0.0` для тестов
+- OpenSSL CLI — только для дополнительных interoperability/TLS-проверок. Если OpenSSL не установлен, соответствующий pytest-тест пропускается.
+
+## Установка
+
+```bash
+python -m venv .venv
+source .venv/bin/activate      # Linux/macOS
+# .venv\Scripts\activate       # Windows PowerShell/CMD
+
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+После установки команда `micropki` доступна из активированного окружения. Без установки можно использовать `python -m micropki`.
+
+## Sprint 1: создание Root CA
+
+```bash
+mkdir -p secrets logs
+printf "root-passphrase\n" > secrets/root.pass
+
+micropki ca init \
+  --subject "/CN=Demo Root CA,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 4096 \
+  --passphrase-file ./secrets/root.pass \
+  --out-dir ./pki \
+  --validity-days 7300 \
+  --log-file ./logs/ca-init.log
+```
+
+ECC-вариант Root CA:
+
+```bash
+micropki ca init \
+  --subject "CN=ECC Root CA,O=MicroPKI" \
+  --key-type ecc \
+  --key-size 384 \
+  --passphrase-file ./secrets/root.pass \
+  --out-dir ./pki-ecc
+```
+
+Если выходные файлы уже существуют, `ca init` запросит подтверждение перезаписи. Для перезаписи без вопроса используйте `--force`.
+
+## Sprint 2: выпуск Intermediate CA
+
+```bash
+printf "intermediate-passphrase\n" > secrets/intermediate.pass
+
+micropki ca issue-intermediate \
+  --root-cert ./pki/certs/ca.cert.pem \
+  --root-key ./pki/private/ca.key.pem \
+  --root-pass-file ./secrets/root.pass \
+  --subject "CN=MicroPKI Intermediate CA,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 4096 \
+  --passphrase-file ./secrets/intermediate.pass \
+  --out-dir ./pki \
+  --validity-days 1825 \
+  --pathlen 0
+```
+
+Команда создаёт:
+
+```text
+pki/private/intermediate.key.pem
+pki/certs/intermediate.cert.pem
+pki/csrs/intermediate.csr.pem
+```
+
+Ключ Intermediate CA хранится зашифрованным PKCS#8 PEM. В `policy.txt` добавляется секция Intermediate CA с subject, serial, validity, key algorithm/size, path length и issuer.
+
+## Sprint 2: выпуск server certificate
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --subject "CN=example.com,O=MicroPKI" \
+  --san dns:example.com \
+  --san dns:www.example.com \
+  --san ip:192.168.1.10 \
+  --out-dir ./pki/certs \
+  --validity-days 365
+```
+
+Для `server` обязателен хотя бы один `dns:` или `ip:` SAN. Конечный приватный ключ сохраняется рядом с сертификатом в открытом PEM-виде с правами `0o600`; утилита пишет предупреждение в лог.
+
+## Sprint 2: выпуск client certificate
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template client \
+  --subject "CN=Alice Smith,EMAIL=alice@example.com" \
+  --san email:alice@example.com \
+  --out-dir ./pki/certs
+```
+
+Для `client` допустимы `email:` и `dns:` SAN.
+
+## Sprint 2: выпуск code signing certificate
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template code_signing \
+  --subject "CN=MicroPKI Code Signer" \
+  --out-dir ./pki/certs
+```
+
+Для `code_signing` SAN не обязателен. Если SAN указан, допускаются только `dns:` и `uri:`.
+
+## Sprint 2: подпись внешнего CSR
+
+Опционально `issue-cert` принимает `--csr`. CSR проверяется по подписи. Если CSR запрашивает `CA=TRUE`, выпуск конечного сертификата отклоняется.
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --subject "CN=csr.example.com" \
+  --san dns:csr.example.com \
+  --csr ./external/server.csr.pem \
+  --out-dir ./pki/certs
+```
+
+## Проверка Root CA
+
+```bash
+micropki ca verify --cert ./pki/certs/ca.cert.pem
+```
+
+Ожидаемый результат:
+
+```text
+/path/to/pki/certs/ca.cert.pem: OK
+```
+
+## Проверка цепочки leaf → intermediate → root
+
+```bash
+micropki ca verify-chain \
+  --root-cert ./pki/certs/ca.cert.pem \
+  --intermediate-cert ./pki/certs/intermediate.cert.pem \
+  --cert ./pki/certs/example.com.cert.pem \
+  --purpose server
+```
+
+Команда проверяет подписи, сроки действия, Basic Constraints и базовое соответствие Key Usage / Extended Key Usage.
+
+## Дополнительная проверка через OpenSSL
+
+Инспекция расширений:
+
+```bash
+openssl x509 -in ./pki/certs/intermediate.cert.pem -text -noout
+openssl x509 -in ./pki/certs/example.com.cert.pem -text -noout
+```
+
+Проверка цепочки через OpenSSL:
+
+```bash
+openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/intermediate.cert.pem
+openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermediate.cert.pem ./pki/certs/example.com.cert.pem
+```
+
+Также есть скрипт:
+
+```bash
+python scripts/openssl_verify_chain.py \
+  --root-cert ./pki/certs/ca.cert.pem \
+  --intermediate-cert ./pki/certs/intermediate.cert.pem \
+  --cert ./pki/certs/example.com.cert.pem
+```
+
+Примечание: в Sprint 1 AKI у Root CA намеренно помечен critical по требованию проверки. Некоторые версии OpenSSL могут отклонять такой Root CA как `unhandled critical extension`; поэтому основная проверка реализована встроенной командой `micropki ca verify-chain`.
+
+## TLS round-trip test
+
+Для демонстрации server certificate в TLS можно использовать OpenSSL-скрипт:
+
+```bash
+python scripts/tls_roundtrip.py \
+  --root-cert ./pki/certs/ca.cert.pem \
+  --chain-cert ./pki/certs/intermediate.cert.pem \
+  --server-cert ./pki/certs/example.com.cert.pem \
+  --server-key ./pki/certs/example.com.key.pem
+```
+
+Скрипт запускает `openssl s_server` и подключается к нему через `openssl s_client`, доверяя Root CA.
+
+## Тестирование
+
+```bash
+make test
+```
+
+На Windows `make` может отсутствовать в Git Bash. В этом случае используйте:
+
+```bash
+python run_tests.py
+```
+
+или напрямую:
+
+```bash
+python -m pytest -q
+```
+
+Для CMD также доступен:
+
+```bat
+run_tests.bat
+```
+
+## Структура проекта
+
+```text
+micropki/
+  __init__.py
+  __main__.py
+  ca.py
+  certificates.py
+  chain.py
+  cli.py
+  crypto_utils.py
+  csr.py
+  logger.py
+  templates.py
+scripts/
+  openssl_verify_chain.py
+  tls_roundtrip.py
+tests/
+  test_micropki.py
+  test_openssl_compat.py
+  test_sprint2.py
+pyproject.toml
+requirements.txt
+Makefile
+run_tests.py
+run_tests.bat
+run_tests.sh
+README.md
+COMPLIANCE_REPORT.md
+```

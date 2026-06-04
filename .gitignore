@@ -6,11 +6,14 @@ __pycache__/
 venv/
 .venv/
 .env
+.pytest_cache/
 
 # Артефакты сборки
 micropki.egg-info/
 dist/
 build/
+.coverage
+htmlcov/
 
 # PKI Артефакты
 pki/
@@ -21,6 +24,7 @@ pki/
 # Конфиденциальные данные и логи
 secrets/
 logs/
+*.log
 
 # IDE
 .idea/
