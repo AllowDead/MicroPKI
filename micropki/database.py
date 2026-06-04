@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .crypto_utils import name_to_string
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 VALID_STATUSES = {"valid", "revoked", "expired"}
 _SERIAL_RE = re.compile(r"^[0-9A-Fa-f]+$")
 
@@ -114,10 +114,23 @@ def init_database(db_path: str = "./pki/micropki.db") -> str:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crl_metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ca_subject TEXT NOT NULL,
+                crl_number INTEGER NOT NULL,
+                last_generated TEXT NOT NULL,
+                next_update TEXT NOT NULL,
+                crl_path TEXT NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_serial_hex ON certificates(serial_hex)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_status ON certificates(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_issuer ON certificates(issuer)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_not_after ON certificates(not_after)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_now_iso()),
@@ -304,6 +317,95 @@ def update_certificate_status(
 def list_revoked_certificates(db_path: str) -> list[dict]:
     return list_certificates(db_path, status="revoked")
 
+
+
+def get_revoked_certificates_by_issuer(db_path: str, issuer: str) -> list[dict]:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM certificates
+             WHERE status = 'revoked' AND issuer = ?
+             ORDER BY revocation_date, serial_hex
+            """,
+            (issuer,),
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
+def get_crl_metadata(db_path: str, ca_subject: str) -> Optional[dict]:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM crl_metadata WHERE ca_subject = ?",
+            (ca_subject,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def next_crl_number(db_path: str, ca_subject: str) -> int:
+    meta = get_crl_metadata(db_path, ca_subject)
+    if not meta:
+        return 1
+    return int(meta["crl_number"]) + 1
+
+
+def upsert_crl_metadata(
+    db_path: str,
+    ca_subject: str,
+    crl_number: int,
+    last_generated: str,
+    next_update: str,
+    crl_path: str,
+) -> None:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO crl_metadata(ca_subject, crl_number, last_generated, next_update, crl_path)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ca_subject) DO UPDATE SET
+                crl_number = excluded.crl_number,
+                last_generated = excluded.last_generated,
+                next_update = excluded.next_update,
+                crl_path = excluded.crl_path
+            """,
+            (ca_subject, int(crl_number), last_generated, next_update, crl_path),
+        )
+
+
+def revoke_certificate(db_path: str, serial_hex: str, reason: str, revoked_at: Optional[str] = None) -> tuple[str, Optional[dict]]:
+    """Revoke a certificate.
+
+    Returns (status, record) where status is one of: revoked, already_revoked,
+    not_found. record is the certificate row after lookup.
+    """
+    serial_hex = normalize_serial_hex(serial_hex)
+    revoked_at = revoked_at or utc_now_iso()
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM certificates WHERE UPPER(serial_hex) = ?",
+            (serial_hex,),
+        ).fetchone()
+        if not row:
+            return "not_found", None
+        record = _row_to_dict(row)
+        if record["status"] == "revoked":
+            return "already_revoked", record
+        conn.execute(
+            """
+            UPDATE certificates
+               SET status = 'revoked', revocation_reason = ?, revocation_date = ?
+             WHERE UPPER(serial_hex) = ?
+            """,
+            (reason, revoked_at, serial_hex),
+        )
+        updated = conn.execute(
+            "SELECT * FROM certificates WHERE UPPER(serial_hex) = ?",
+            (serial_hex,),
+        ).fetchone()
+        return "revoked", _row_to_dict(updated)
 
 def format_records_table(records: Iterable[dict]) -> str:
     rows = list(records)

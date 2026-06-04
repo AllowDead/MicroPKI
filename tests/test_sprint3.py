@@ -197,7 +197,7 @@ def test_repository_api_fetches_certificate_ca_and_handles_errors():
             assert bad_serial.value.code == 400
             with pytest.raises(urllib.error.HTTPError) as crl:
                 urllib.request.urlopen(f"{base}/crl", timeout=5)
-            assert crl.value.code == 501
+            assert crl.value.code == 404
         finally:
             server.shutdown()
             server.server_close()

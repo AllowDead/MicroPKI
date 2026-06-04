@@ -84,10 +84,12 @@ def init_ca(args, logger):
 
     private_dir = os.path.join(out_dir, "private")
     certs_dir = os.path.join(out_dir, "certs")
+    crl_dir = os.path.join(out_dir, "crl")
 
     try:
         os.makedirs(private_dir, mode=0o700, exist_ok=True)
         os.makedirs(certs_dir, exist_ok=True)
+        os.makedirs(crl_dir, exist_ok=True)
         if os.name != "nt":
             os.chmod(private_dir, 0o700)
     except OSError as exc:
@@ -252,9 +254,11 @@ def issue_intermediate(args, logger):
     private_dir = os.path.join(out_dir, "private")
     certs_dir = os.path.join(out_dir, "certs")
     csrs_dir = os.path.join(out_dir, "csrs")
+    crl_dir = os.path.join(out_dir, "crl")
     os.makedirs(private_dir, mode=0o700, exist_ok=True)
     os.makedirs(certs_dir, exist_ok=True)
     os.makedirs(csrs_dir, exist_ok=True)
+    os.makedirs(crl_dir, exist_ok=True)
     if os.name != "nt":
         os.chmod(private_dir, 0o700)
 

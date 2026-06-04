@@ -245,6 +245,11 @@ micropki/
   csr.py
   logger.py
   templates.py
+  database.py
+  repository.py
+  serial.py
+  crl.py
+  revocation.py
 scripts/
   openssl_verify_chain.py
   tls_roundtrip.py
@@ -259,6 +264,7 @@ run_tests.py
 run_tests.bat
 run_tests.sh
 README.md
+COMPLIANCE_REPORT.md
 ```
 
 ## Sprint 3: база сертификатов SQLite
@@ -364,7 +370,9 @@ curl -i http://127.0.0.1:8080/crl
 GET /certificate/<serial>   # PEM сертификата из SQLite, 400 для не-hex serial, 404 если не найден
 GET /ca/root                # pki/certs/ca.cert.pem
 GET /ca/intermediate        # pki/certs/intermediate.cert.pem
-GET /crl                    # 501, заглушка под Sprint 4
+GET /crl                    # текущий Intermediate CRL, 404 если CRL ещё не создан
+GET /crl?ca=root            # Root CRL
+GET /crl/intermediate.crl   # альтернативный путь к CRL
 ```
 
 Все ответы HTTP включают `Access-Control-Allow-Origin: *`. Каждый запрос логируется в формате с префиксом `[HTTP]`, методом, путём, IP клиента и статусом ответа.
@@ -390,3 +398,125 @@ python run_tests.py
 ```
 
 На текущей версии тестовый набор покрывает SQLite-схему, уникальность serial, автоматическую вставку сертификатов, CLI `list-certs`/`show-cert`, HTTP API `/certificate/<serial>`, `/ca/root`, `/ca/intermediate`, `/crl`, CORS и негативную проверку невалидного serial.
+
+
+## Sprint 4: отзыв сертификатов и CRL
+
+Sprint 4 добавляет полный цикл отзыва сертификатов: запись статуса в SQLite, генерацию X.509 CRL v2, хранение CRL в `pki/crl/` и HTTP-раздачу CRL через репозиторий.
+
+Структура `pki/` теперь включает каталог CRL:
+
+```text
+pki/
+  private/
+  certs/
+  csrs/
+  crl/
+    root.crl.pem
+    intermediate.crl.pem
+  micropki.db
+  policy.txt
+```
+
+Поддерживаемые причины отзыва:
+
+```text
+unspecified, keyCompromise, cACompromise, affiliationChanged,
+superseded, cessationOfOperation, certificateHold, removeFromCRL,
+privilegeWithdrawn, aACompromise
+```
+
+Отзыв сертификата по serial:
+
+```bash
+micropki ca revoke 2A7F \
+  --reason keyCompromise \
+  --db-path ./pki/micropki.db \
+  --force
+```
+
+Без `--force` команда запросит интерактивное подтверждение. Если сертификат уже отозван, команда пишет предупреждение и завершается успешно без изменения записи. Если serial не найден, команда возвращает ненулевой код.
+
+Генерация Intermediate CRL:
+
+```bash
+micropki ca gen-crl \
+  --ca intermediate \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --out-dir ./pki \
+  --db-path ./pki/micropki.db \
+  --next-update 7
+```
+
+Генерация Root CRL:
+
+```bash
+micropki ca gen-crl \
+  --ca root \
+  --ca-pass-file ./secrets/root.pass \
+  --out-dir ./pki \
+  --db-path ./pki/micropki.db
+```
+
+Можно явно указать пути к CA certificate/key и выходному CRL-файлу:
+
+```bash
+micropki ca gen-crl \
+  --ca intermediate \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --out-file ./backup/intermediate.crl.pem \
+  --db-path ./pki/micropki.db
+```
+
+Быстрая проверка статуса в базе:
+
+```bash
+micropki ca check-revoked 2A7F --db-path ./pki/micropki.db
+```
+
+## Sprint 4: CRL через HTTP repository
+
+Запуск сервера с каталогом CRL:
+
+```bash
+micropki repo serve \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --db-path ./pki/micropki.db \
+  --cert-dir ./pki/certs \
+  --crl-dir ./pki/crl
+```
+
+Получение CRL:
+
+```bash
+curl -H "Accept: application/pkix-crl" http://127.0.0.1:8080/crl --output intermediate.crl.pem
+curl http://127.0.0.1:8080/crl?ca=root --output root.crl.pem
+curl http://127.0.0.1:8080/crl/intermediate.crl --output intermediate.crl.pem
+```
+
+Ответ CRL возвращается с `Content-Type: application/pkix-crl`, `Access-Control-Allow-Origin: *`, `Last-Modified`, `Cache-Control` и `ETag`. Если CRL-файл ещё не создан, сервер возвращает `404 Not Found`.
+
+## Sprint 4: проверка CRL
+
+Инспекция CRL:
+
+```bash
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -text -noout
+```
+
+Проверка подписи CRL Intermediate CA:
+
+```bash
+openssl crl \
+  -in ./pki/crl/intermediate.crl.pem \
+  -inform PEM \
+  -CAfile ./pki/certs/intermediate.cert.pem \
+  -noout
+```
+
+Ожидаемый результат OpenSSL: `verify OK`.
+
+Полный жизненный цикл в тестах покрывает выпуск leaf-сертификата, отзыв с причиной `keyCompromise`, обновление полей `status`, `revocation_reason`, `revocation_date`, генерацию CRL, наличие serial в CRL, увеличение CRL Number, HTTP-раздачу CRL и негативные сценарии для отсутствующего/уже отозванного сертификата.

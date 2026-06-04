@@ -178,6 +178,71 @@ def validate_issue_cert_args(args, logger):
         sys.exit(1)
 
 
+
+def validate_revoke_args(args, logger):
+    errors = []
+    try:
+        from .database import normalize_serial_hex
+        normalize_serial_hex(args.serial)
+    except ValueError as exc:
+        errors.append(str(exc))
+    try:
+        from .revocation import normalize_reason
+        normalize_reason(args.reason)
+    except ValueError as exc:
+        errors.append(str(exc))
+    _validate_db_parent(getattr(args, "db_path", DEFAULT_DB_PATH), errors)
+    if getattr(args, "crl", None):
+        parent = os.path.dirname(os.path.abspath(args.crl)) or "."
+        if os.path.exists(parent) and not _is_writable_directory(parent):
+            errors.append(f"Директория для --crl недоступна для записи: {parent}")
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+
+def validate_gen_crl_args(args, logger):
+    errors = []
+    if args.next_update <= 0:
+        errors.append("--next-update обязан быть положительным целым числом.")
+    _validate_common_out_dir(args.out_dir, errors)
+    _validate_db_parent(getattr(args, "db_path", DEFAULT_DB_PATH), errors)
+    ca_cert, ca_key, _ = _resolve_ca_defaults(args.ca, args.out_dir)
+    ca_cert = args.ca_cert or ca_cert
+    ca_key = args.ca_key or ca_key
+    _validate_existing_readable_file(ca_cert, "--ca-cert", errors)
+    _validate_existing_readable_file(ca_key, "--ca-key", errors)
+    if not args.ca_pass_file:
+        errors.append("--ca-pass-file обязателен для расшифровки CA private key при подписи CRL.")
+    else:
+        _validate_existing_readable_file(args.ca_pass_file, "--ca-pass-file", errors)
+    if args.out_file:
+        parent = os.path.dirname(os.path.abspath(args.out_file)) or "."
+        if os.path.exists(parent) and not _is_writable_directory(parent):
+            errors.append(f"Директория для --out-file недоступна для записи: {parent}")
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+
+def _resolve_ca_defaults(ca, out_dir):
+    ca_value = str(ca).strip()
+    if ca_value.lower() == "root":
+        return (
+            os.path.join(out_dir, "certs", "ca.cert.pem"),
+            os.path.join(out_dir, "private", "ca.key.pem"),
+            "root",
+        )
+    if ca_value.lower() == "intermediate":
+        return (
+            os.path.join(out_dir, "certs", "intermediate.cert.pem"),
+            os.path.join(out_dir, "private", "intermediate.key.pem"),
+            "intermediate",
+        )
+    return (ca_value, None, os.path.splitext(os.path.basename(ca_value))[0] or "ca")
+
 def load_passphrase(path):
     with open(path, "rb") as f:
         passphrase = f.read()
@@ -281,6 +346,35 @@ def main():
     _add_db_path_arg(show_parser)
     show_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
+    revoke_parser = ca_subparsers.add_parser("revoke", help="Revoke a certificate by serial number")
+    revoke_parser.add_argument("serial", help="Certificate serial number in hexadecimal")
+    revoke_parser.add_argument("--reason", default="unspecified", help="Revocation reason code")
+    revoke_parser.add_argument("--crl", help="Optional CRL output path to regenerate after revocation")
+    revoke_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    revoke_parser.add_argument("--out-dir", default="./pki", help="PKI output directory used for automatic CRL paths")
+    revoke_parser.add_argument("--next-update", type=int, default=7, help="CRL nextUpdate interval in days if --crl is used")
+    revoke_parser.add_argument("--ca-cert", help="CA certificate PEM used to regenerate CRL")
+    revoke_parser.add_argument("--ca-key", help="CA private key PEM used to regenerate CRL")
+    revoke_parser.add_argument("--ca-pass-file", help="CA private key passphrase file used to regenerate CRL")
+    _add_db_path_arg(revoke_parser)
+    revoke_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    gen_crl_parser = ca_subparsers.add_parser("gen-crl", help="Generate a CRL for Root or Intermediate CA")
+    gen_crl_parser.add_argument("--ca", required=True, help="root, intermediate, or path to a CA certificate")
+    gen_crl_parser.add_argument("--next-update", type=int, default=7, help="Days until next CRL update")
+    gen_crl_parser.add_argument("--out-file", help="CRL output path")
+    gen_crl_parser.add_argument("--out-dir", default="./pki", help="PKI output directory")
+    gen_crl_parser.add_argument("--ca-cert", help="Override CA certificate PEM path")
+    gen_crl_parser.add_argument("--ca-key", help="Override CA private key PEM path")
+    gen_crl_parser.add_argument("--ca-pass-file", required=True, help="CA private key passphrase file")
+    _add_db_path_arg(gen_crl_parser)
+    gen_crl_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    check_parser = ca_subparsers.add_parser("check-revoked", help="Check revocation status by serial number")
+    check_parser.add_argument("serial", help="Certificate serial number in hexadecimal")
+    _add_db_path_arg(check_parser)
+    check_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
     db_parser = subparsers.add_parser("db", help="Database operations")
     db_subparsers = db_parser.add_subparsers(dest="db_command")
     db_init_parser = db_subparsers.add_parser("init", help="Initialise the SQLite certificate database")
@@ -294,6 +388,7 @@ def main():
     serve_parser.add_argument("--port", type=int, default=8080, help="TCP port")
     _add_db_path_arg(serve_parser)
     serve_parser.add_argument("--cert-dir", default="./pki/certs", help="Directory containing CA PEM certificates")
+    serve_parser.add_argument("--crl-dir", default=None, help="Directory containing CRL PEM files (default: sibling ../crl of cert-dir)")
     serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     status_parser = repo_subparsers.add_parser("status", help="Check whether a repository port is accepting TCP connections")
@@ -369,6 +464,74 @@ def main():
         _print_show_cert(args.db_path, args.serial, logger)
         return
 
+    if args.command == "ca" and args.ca_command == "revoke":
+        from .logger import setup_logger
+        from .revocation import revoke_by_serial, normalize_reason
+        logger = setup_logger(args.log_file)
+        validate_revoke_args(args, logger)
+        try:
+            updated = revoke_by_serial(args.db_path, args.serial, normalize_reason(args.reason), force=args.force, logger=logger)
+            if updated is None:
+                sys.exit(1)
+            print(f"{updated['serial_hex']}: {updated['status']}")
+            if args.crl:
+                if not args.ca_cert or not args.ca_key or not args.ca_pass_file:
+                    logger.warning("--crl was supplied but --ca-cert, --ca-key and --ca-pass-file are required to regenerate a signed CRL.")
+                else:
+                    from .crl import generate_crl
+                    passphrase = load_passphrase(args.ca_pass_file)
+                    generate_crl(args.db_path, args.ca_cert, args.ca_key, passphrase, args.crl, args.next_update, logger)
+                    print(f"CRL: {args.crl}")
+        except PermissionError as exc:
+            logger.error(str(exc))
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        except KeyError as exc:
+            print(str(exc).strip("'"), file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            logger.error(f"Revocation failed: {exc}")
+            print(f"Revocation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "ca" and args.ca_command == "gen-crl":
+        from .logger import setup_logger
+        from .crl import generate_crl
+        logger = setup_logger(args.log_file)
+        validate_gen_crl_args(args, logger)
+        ca_cert, ca_key, ca_name = _resolve_ca_defaults(args.ca, args.out_dir)
+        ca_cert = args.ca_cert or ca_cert
+        ca_key = args.ca_key or ca_key
+        out_file = args.out_file or os.path.join(args.out_dir, "crl", f"{ca_name}.crl.pem")
+        try:
+            result = generate_crl(args.db_path, ca_cert, ca_key, load_passphrase(args.ca_pass_file), out_file, args.next_update, logger)
+            print(f"CRL: {result.path}")
+            print(f"CRL number: {result.crl_number}")
+            print(f"Revoked certificates: {result.revoked_count}")
+        except Exception as exc:
+            logger.error(f"CRL generation failed: {exc}")
+            print(f"CRL generation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "ca" and args.ca_command == "check-revoked":
+        from .database import get_certificate_by_serial
+        from .logger import setup_logger
+        logger = setup_logger(args.log_file)
+        try:
+            record = get_certificate_by_serial(args.db_path, args.serial)
+        except ValueError as exc:
+            logger.error(str(exc))
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        if not record:
+            logger.error(f"Certificate not found: serial={args.serial}")
+            print("Certificate not found", file=sys.stderr)
+            sys.exit(1)
+        print(record["status"])
+        sys.exit(0 if record["status"] == "revoked" else 1)
+
     if args.command == "db" and args.db_command == "init":
         from .database import init_database
         from .logger import setup_logger
@@ -394,7 +557,7 @@ def main():
         from .repository import serve_repository
         logger = setup_logger(args.log_file)
         try:
-            serve_repository(args.host, args.port, args.db_path, args.cert_dir, logger)
+            serve_repository(args.host, args.port, args.db_path, args.cert_dir, logger, args.crl_dir)
         except OSError as exc:
             logger.error(f"Repository server failed: {exc}")
             print(f"Repository server failed: {exc}", file=sys.stderr)
