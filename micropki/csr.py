@@ -23,3 +23,15 @@ def load_csr_pem(path):
 def verify_csr_signature(csr):
     if not csr.is_signature_valid:
         raise ValueError("Подпись CSR некорректна")
+
+
+def csr_sans(csr):
+    """Return SAN GeneralName values from a CSR, or an empty list."""
+    try:
+        return list(csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except x509.ExtensionNotFound:
+        return []
+
+
+def load_csr_from_pem_bytes(data: bytes):
+    return x509.load_pem_x509_csr(data)

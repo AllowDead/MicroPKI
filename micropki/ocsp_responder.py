@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 from urllib.parse import urlparse
 
 from .certificates import load_certificate
 from .database import init_database
 from .ocsp import load_ocsp_private_key, process_ocsp_request, validate_ocsp_signer_certificate
 
+
+class MicroPKIThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def shutdown(self):
+        # BaseServer.shutdown can block forever in rare test races if called
+        # while serve_forever is not fully inside its loop. Bound it.
+        t = threading.Thread(target=super().shutdown, daemon=True)
+        t.start()
+        t.join(timeout=2)
 
 class OCSPRequestHandler(BaseHTTPRequestHandler):
     server_version = "MicroPKIOCSP/0.5"
@@ -95,7 +106,7 @@ def create_ocsp_server(
     responder_key = load_ocsp_private_key(responder_key_path)
     ca_cert = load_certificate(ca_cert_path)
 
-    server = ThreadingHTTPServer((host, int(port)), OCSPRequestHandler)
+    server = MicroPKIThreadingHTTPServer((host, int(port)), OCSPRequestHandler)
     server.db_path = os.path.abspath(db_path)
     server.responder_cert = responder_cert
     server.responder_key = responder_key

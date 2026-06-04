@@ -6,7 +6,10 @@ import email.utils
 import hashlib
 import os
 import re
+import tempfile
+from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 from urllib.parse import parse_qs, urlparse
 
 from cryptography import x509
@@ -15,6 +18,14 @@ from .database import get_certificate_by_serial, normalize_serial_hex
 
 _SERIAL_RE = re.compile(r"^[0-9A-Fa-f]+$")
 
+
+class MicroPKIThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def shutdown(self):
+        t = threading.Thread(target=super().shutdown, daemon=True)
+        t.start()
+        t.join(timeout=2)
 
 class RepositoryRequestHandler(BaseHTTPRequestHandler):
     server_version = "MicroPKIRepository/0.4"
@@ -68,8 +79,8 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
         self.end_headers()
         self._log_request(204)
 
@@ -95,6 +106,9 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
         return self._send_text(404, "Not Found")
 
     def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/request-cert":
+            return self._handle_request_cert(parsed)
         self._send_text(405, "Method Not Allowed")
 
     def do_PUT(self):
@@ -102,6 +116,58 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._send_text(405, "Method Not Allowed")
+
+    def _handle_request_cert(self, parsed):
+        template = (parse_qs(parsed.query).get("template") or [""])[0]
+        if template not in {"server", "client", "code_signing"}:
+            return self._send_text(400, "Unsupported or missing template")
+        expected_key = getattr(self.server, "api_key", None)
+        if expected_key and self.headers.get("X-API-Key") != expected_key:
+            return self._send_text(401, "Invalid or missing API key")
+        if not getattr(self.server, "ca_cert_path", None) or not getattr(self.server, "ca_key_path", None):
+            return self._send_text(503, "Repository is not configured for certificate issuance")
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            return self._send_text(400, "Invalid Content-Length")
+        if length <= 0:
+            return self._send_text(400, "Empty CSR request")
+        csr_data = self.rfile.read(length)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".csr.pem") as tmp:
+                tmp.write(csr_data)
+                tmp_path = tmp.name
+            from .ca import issue_cert
+            from .cli import load_passphrase
+            passphrase = load_passphrase(self.server.ca_pass_file) if getattr(self.server, "ca_pass_file", None) else None
+            args = Namespace(
+                ca_cert=self.server.ca_cert_path,
+                ca_key=self.server.ca_key_path,
+                ca_pass_file=getattr(self.server, "ca_pass_file", None),
+                ca_passphrase_bytes=passphrase,
+                template=template,
+                subject=None,
+                san=[],
+                out_dir=self.cert_dir,
+                validity_days=int(getattr(self.server, "default_validity_days", 365)),
+                csr=tmp_path,
+                db_path=self.db_path,
+            )
+            result = issue_cert(args, self.repo_logger)
+            if self.repo_logger:
+                self.repo_logger.info(f"API certificate issuance completed: source_ip={self.client_address[0]}, template={template}, serial={result['serial_hex']}")
+            return self._send_bytes(201, result["cert_pem"], "application/x-pem-file")
+        except SystemExit:
+            return self._send_text(400, "Certificate issuance failed")
+        except Exception as exc:
+            return self._send_text(400, f"Certificate issuance failed: {exc}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _handle_certificate(self, serial: str):
         serial = serial.strip()
@@ -164,20 +230,53 @@ def _crl_headers(path: str, data: bytes) -> dict[str, str]:
     return headers
 
 
-def create_repository_server(host: str, port: int, db_path: str, cert_dir: str, logger=None, crl_dir: str | None = None) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((host, int(port)), RepositoryRequestHandler)
+def create_repository_server(
+    host: str,
+    port: int,
+    db_path: str,
+    cert_dir: str,
+    logger=None,
+    crl_dir: str | None = None,
+    ca_cert_path: str | None = None,
+    ca_key_path: str | None = None,
+    ca_pass_file: str | None = None,
+    api_key: str | None = None,
+    default_validity_days: int = 365,
+) -> ThreadingHTTPServer:
+    server = MicroPKIThreadingHTTPServer((host, int(port)), RepositoryRequestHandler)
     server.db_path = os.path.abspath(db_path)
     server.cert_dir = os.path.abspath(cert_dir)
     server.crl_dir = os.path.abspath(crl_dir or os.path.join(os.path.dirname(os.path.abspath(cert_dir)), "crl"))
     server.repo_logger = logger
+    server.ca_cert_path = os.path.abspath(ca_cert_path) if ca_cert_path else None
+    server.ca_key_path = os.path.abspath(ca_key_path) if ca_key_path else None
+    server.ca_pass_file = os.path.abspath(ca_pass_file) if ca_pass_file else None
+    server.api_key = api_key
+    server.default_validity_days = default_validity_days
     return server
 
 
-def serve_repository(host: str, port: int, db_path: str, cert_dir: str, logger=None, crl_dir: str | None = None) -> None:
+def serve_repository(
+    host: str,
+    port: int,
+    db_path: str,
+    cert_dir: str,
+    logger=None,
+    crl_dir: str | None = None,
+    ca_cert_path: str | None = None,
+    ca_key_path: str | None = None,
+    ca_pass_file: str | None = None,
+    api_key: str | None = None,
+    default_validity_days: int = 365,
+) -> None:
     from .database import init_database
 
     init_database(db_path)
-    server = create_repository_server(host, port, db_path, cert_dir, logger, crl_dir)
+    server = create_repository_server(
+        host, port, db_path, cert_dir, logger, crl_dir,
+        ca_cert_path=ca_cert_path, ca_key_path=ca_key_path, ca_pass_file=ca_pass_file,
+        api_key=api_key, default_validity_days=default_validity_days,
+    )
     if logger:
         logger.info(
             f"Repository server listening on {host}:{port}; db={os.path.abspath(db_path)}; "

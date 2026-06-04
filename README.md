@@ -655,3 +655,153 @@ micropki/
 
 `ocsp.py` содержит разбор OCSP request, построение signed OCSP response, nonce handling, status determination и проверку OCSP signer certificate.  
 `ocsp_responder.py` содержит HTTP-server для `micropki ocsp serve`.
+
+## Sprint 6: client CSR generation
+
+Generate an end-entity private key and PKCS#10 CSR:
+
+```bash
+micropki client gen-csr \
+  --subject "CN=app.example.com,O=MicroPKI" \
+  --key-type rsa \
+  --key-size 2048 \
+  --san dns:app.example.com \
+  --san dns:api.example.com \
+  --out-key ./app.key.pem \
+  --out-csr ./app.csr.pem
+```
+
+The generated private key is unencrypted PEM and is written with `0o600` permissions where the operating system supports POSIX file modes. The command logs a warning because this key is not passphrase-protected.
+
+## Sprint 6: CSR-based certificate issuance
+
+`ca issue-cert` now accepts an external CSR:
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --csr ./app.csr.pem \
+  --out-dir ./pki/certs \
+  --db-path ./pki/micropki.db
+```
+
+When `--csr` is used, the certificate subject and SANs are taken from the CSR. The CSR signature is verified. A CSR that requests `CA=TRUE` is rejected for end-entity issuance.
+
+## Sprint 6: repository certificate request endpoint
+
+The repository server can issue certificates through `POST /request-cert` when CA credentials are supplied at startup:
+
+```bash
+micropki repo serve \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --db-path ./pki/micropki.db \
+  --cert-dir ./pki/certs \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --api-key changeme
+```
+
+The demo API key is intentionally simple and is not production authentication. For a coursework/demo system it proves the flow; a real CA would require strong authentication, authorisation, approval workflow, rate limiting and audit controls.
+
+Manual request example:
+
+```bash
+cat ./app.csr.pem | curl -X POST \
+  -H "Content-Type: application/x-pem-file" \
+  -H "X-API-Key: changeme" \
+  --data-binary @- \
+  "http://localhost:8080/request-cert?template=server" \
+  --output ./app.cert.pem
+```
+
+Client wrapper:
+
+```bash
+micropki client request-cert \
+  --csr ./app.csr.pem \
+  --template server \
+  --ca-url http://localhost:8080 \
+  --api-key changeme \
+  --out-cert ./app.cert.pem
+```
+
+## Sprint 6: certificate chain validation
+
+Validate a leaf certificate against an intermediate and trusted root:
+
+```bash
+micropki client validate \
+  --cert ./app.cert.pem \
+  --untrusted ./pki/certs/intermediate.cert.pem \
+  --trusted ./pki/certs/ca.cert.pem \
+  --purpose server \
+  --mode chain
+```
+
+Full validation with revocation checking:
+
+```bash
+micropki client validate \
+  --cert ./app.cert.pem \
+  --untrusted ./pki/certs/intermediate.cert.pem \
+  --trusted ./pki/certs/ca.cert.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ocsp \
+  --ocsp-url http://127.0.0.1:8081/ocsp \
+  --crl http://127.0.0.1:8080/crl?ca=intermediate \
+  --purpose server \
+  --mode full
+```
+
+The validator builds the shortest chain from leaf to trusted root, then checks signatures, validity periods, Basic Constraints, path length constraints, CA Key Usage and optional EKU purpose.
+
+`--validation-time` can be used to test expired or not-yet-valid certificates:
+
+```bash
+micropki client validate \
+  --cert ./app.cert.pem \
+  --untrusted ./pki/certs/intermediate.cert.pem \
+  --trusted ./pki/certs/ca.cert.pem \
+  --validation-time 2035-01-01T00:00:00Z
+```
+
+## Sprint 6: revocation status checking
+
+Standalone revocation status check:
+
+```bash
+micropki client check-status \
+  --cert ./app.cert.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ocsp-url http://127.0.0.1:8081/ocsp \
+  --crl ./pki/crl/intermediate.crl.pem
+```
+
+Preference logic:
+
+```text
+1. Try OCSP first if --ocsp-url is supplied or an OCSP AIA URI exists in the certificate.
+2. If OCSP returns good or revoked with a valid response, use that status.
+3. If OCSP is unreachable, malformed, invalid, or unknown, fall back to CRL.
+4. If CRL is valid and contains the certificate serial, status is revoked.
+5. If CRL is valid and does not contain the serial, status is good.
+6. If neither OCSP nor CRL can provide a definitive answer, status is unknown.
+```
+
+The client can parse OCSP responder URIs from Authority Information Access and CRL URLs from CRL Distribution Points when those extensions are present. Manual `--ocsp-url` and `--crl` flags override discovery.
+
+## Sprint 6: structure
+
+```text
+micropki/
+  validation.py
+  revocation_check.py
+  client.py
+```
+
+`validation.py` contains custom simplified RFC 5280 path building and validation. `revocation_check.py` contains CRL and OCSP client checks with fallback. `client.py` contains CSR generation, certificate request, validation and status-check helper functions.

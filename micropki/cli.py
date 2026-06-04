@@ -151,20 +151,21 @@ def validate_issue_cert_args(args, logger):
         _validate_existing_readable_file(path, name, errors)
     if args.csr:
         _validate_existing_readable_file(args.csr, "--csr", errors)
-
-    if not args.subject or not args.subject.strip():
-        errors.append("Должен быть указан непустой --subject.")
     else:
-        try:
-            from .crypto_utils import parse_dn
-            parse_dn(args.subject)
-        except ValueError as exc:
-            errors.append(f"Некорректный --subject: {exc}")
+        if not args.subject or not args.subject.strip():
+            errors.append("Должен быть указан непустой --subject, если не используется --csr.")
+        else:
+            try:
+                from .crypto_utils import parse_dn
+                parse_dn(args.subject)
+            except ValueError as exc:
+                errors.append(f"Некорректный --subject: {exc}")
 
     try:
         from .templates import parse_san_entries, validate_template_sans
-        names = parse_san_entries(args.san or [])
-        validate_template_sans(args.template, names)
+        if not args.csr:
+            names = parse_san_entries(args.san or [])
+            validate_template_sans(args.template, names)
     except ValueError as exc:
         errors.append(str(exc))
 
@@ -302,6 +303,45 @@ def validate_ocsp_serve_args(args, logger):
         sys.exit(1)
 
 
+
+def validate_client_gen_csr_args(args, logger):
+    errors = []
+    if not args.subject or not args.subject.strip():
+        errors.append("Должен быть указан непустой --subject.")
+    else:
+        try:
+            from .crypto_utils import parse_dn
+            parse_dn(args.subject)
+        except ValueError as exc:
+            errors.append(f"Некорректный --subject: {exc}")
+    if args.key_type == "rsa" and args.key_size not in {2048, 4096}:
+        errors.append("Для client gen-csr RSA --key-size должен быть 2048 или 4096.")
+    if args.key_type == "ecc" and args.key_size not in {256, 384}:
+        errors.append("Для client gen-csr ECC --key-size должен быть 256 или 384.")
+    try:
+        from .templates import parse_san_entries
+        parse_san_entries(args.san or [])
+    except ValueError as exc:
+        errors.append(str(exc))
+    for attr in ["out_key", "out_csr"]:
+        parent = os.path.dirname(os.path.abspath(getattr(args, attr))) or "."
+        if os.path.exists(parent) and not _is_writable_directory(parent):
+            errors.append(f"Директория для --{attr.replace('_','-')} недоступна для записи: {parent}")
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+
+def _parse_validation_time(value):
+    if not value:
+        return None
+    import datetime as _dt
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return _dt.datetime.fromisoformat(text)
+
 def load_passphrase(path):
     with open(path, "rb") as f:
         passphrase = f.read()
@@ -378,7 +418,7 @@ def main():
     cert_parser.add_argument("--ca-key", required=True, help="Path to Intermediate CA encrypted private key PEM")
     cert_parser.add_argument("--ca-pass-file", required=True, help="Path to Intermediate CA passphrase file")
     cert_parser.add_argument("--template", required=True, choices=["server", "client", "code_signing"], help="Certificate template")
-    cert_parser.add_argument("--subject", required=True, help="Leaf certificate Subject DN")
+    cert_parser.add_argument("--subject", help="Leaf certificate Subject DN; ignored when --csr is used")
     cert_parser.add_argument("--san", action="append", default=[], help="SAN entry: dns:example.com, ip:192.168.1.1, email:a@b, uri:https://...")
     cert_parser.add_argument("--out-dir", default="./pki/certs", help="Output directory for issued cert/key")
     cert_parser.add_argument("--validity-days", type=int, default=365, help="Leaf validity period")
@@ -461,6 +501,11 @@ def main():
     _add_db_path_arg(serve_parser)
     serve_parser.add_argument("--cert-dir", default="./pki/certs", help="Directory containing CA PEM certificates")
     serve_parser.add_argument("--crl-dir", default=None, help="Directory containing CRL PEM files (default: sibling ../crl of cert-dir)")
+    serve_parser.add_argument("--ca-cert", help="Issuer CA certificate PEM for POST /request-cert")
+    serve_parser.add_argument("--ca-key", help="Issuer CA private key PEM for POST /request-cert")
+    serve_parser.add_argument("--ca-pass-file", help="Issuer CA passphrase file for POST /request-cert")
+    serve_parser.add_argument("--api-key", help="Optional pre-shared key required in X-API-Key for POST /request-cert")
+    serve_parser.add_argument("--default-validity-days", type=int, default=365, help="Default validity for certificates issued via API")
     serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     status_parser = repo_subparsers.add_parser("status", help="Check whether a repository port is accepting TCP connections")
@@ -478,6 +523,47 @@ def main():
     ocsp_serve_parser.add_argument("--ca-cert", required=True, help="Issuer CA certificate PEM")
     ocsp_serve_parser.add_argument("--cache-ttl", type=int, default=60, help="OCSP response cache TTL / nextUpdate seconds")
     ocsp_serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    client_parser = subparsers.add_parser("client", help="Client-side CSR, validation and revocation tools")
+    client_subparsers = client_parser.add_subparsers(dest="client_command")
+
+    gen_csr_parser = client_subparsers.add_parser("gen-csr", help="Generate an end-entity private key and CSR")
+    gen_csr_parser.add_argument("--subject", required=True, help="CSR subject DN")
+    gen_csr_parser.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
+    gen_csr_parser.add_argument("--key-size", type=int, default=2048, help="RSA: 2048/4096; ECC: 256/384")
+    gen_csr_parser.add_argument("--san", action="append", default=[], help="SAN entry: dns:example.com, ip:127.0.0.1, email:a@b, uri:https://...")
+    gen_csr_parser.add_argument("--out-key", default="./key.pem", help="Output private key PEM")
+    gen_csr_parser.add_argument("--out-csr", default="./request.csr.pem", help="Output CSR PEM")
+    gen_csr_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    request_cert_parser = client_subparsers.add_parser("request-cert", help="Submit a CSR to repository POST /request-cert")
+    request_cert_parser.add_argument("--csr", required=True, help="CSR PEM path")
+    request_cert_parser.add_argument("--template", required=True, choices=["server", "client", "code_signing"], help="Certificate template")
+    request_cert_parser.add_argument("--ca-url", required=True, help="Repository base URL, e.g. http://localhost:8080")
+    request_cert_parser.add_argument("--out-cert", default="./cert.pem", help="Output certificate PEM")
+    request_cert_parser.add_argument("--api-key", help="Optional X-API-Key value")
+    request_cert_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    validate_parser = client_subparsers.add_parser("validate", help="Validate a certificate chain")
+    validate_parser.add_argument("--cert", required=True, help="Leaf certificate PEM")
+    validate_parser.add_argument("--untrusted", action="append", default=[], help="Intermediate PEM; can be repeated")
+    validate_parser.add_argument("--trusted", default="./pki/certs/ca.cert.pem", help="Trusted Root CA PEM bundle")
+    validate_parser.add_argument("--crl", help="Optional CRL file or URL for revocation check")
+    validate_parser.add_argument("--ocsp", action="store_true", help="Perform OCSP check when an OCSP URL is available")
+    validate_parser.add_argument("--ocsp-url", help="Override OCSP responder URL")
+    validate_parser.add_argument("--ca-cert", help="Issuer CA certificate for revocation checks; defaults to first --untrusted")
+    validate_parser.add_argument("--mode", choices=["chain", "full"], default="full")
+    validate_parser.add_argument("--purpose", choices=["server", "client", "code_signing"], help="Optional EKU purpose check")
+    validate_parser.add_argument("--validation-time", help="ISO-8601 validation time, e.g. 2026-01-01T00:00:00Z")
+    validate_parser.add_argument("--format", choices=["text", "json"], default="text")
+    validate_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    check_status_parser = client_subparsers.add_parser("check-status", help="Check certificate revocation status using OCSP first, CRL fallback")
+    check_status_parser.add_argument("--cert", required=True, help="Certificate PEM")
+    check_status_parser.add_argument("--ca-cert", required=True, help="Issuer CA certificate PEM")
+    check_status_parser.add_argument("--crl", help="CRL file or URL")
+    check_status_parser.add_argument("--ocsp-url", help="OCSP responder URL override")
+    check_status_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     args = parser.parse_args()
 
@@ -650,7 +736,11 @@ def main():
         from .repository import serve_repository
         logger = setup_logger(args.log_file)
         try:
-            serve_repository(args.host, args.port, args.db_path, args.cert_dir, logger, args.crl_dir)
+            serve_repository(
+                args.host, args.port, args.db_path, args.cert_dir, logger, args.crl_dir,
+                ca_cert_path=args.ca_cert, ca_key_path=args.ca_key, ca_pass_file=args.ca_pass_file,
+                api_key=args.api_key, default_validity_days=args.default_validity_days,
+            )
         except OSError as exc:
             logger.error(f"Repository server failed: {exc}")
             print(f"Repository server failed: {exc}", file=sys.stderr)
@@ -686,6 +776,77 @@ def main():
             logger.error(f"OCSP responder failed: {exc}")
             print(f"OCSP responder failed: {exc}", file=sys.stderr)
             sys.exit(1)
+        return
+
+    if args.command == "client" and args.client_command == "gen-csr":
+        from .logger import setup_logger
+        from .client import generate_csr
+        logger = setup_logger(args.log_file)
+        validate_client_gen_csr_args(args, logger)
+        try:
+            key_path, csr_path = generate_csr(args.subject, args.key_type, args.key_size, args.san, args.out_key, args.out_csr, logger)
+            print(f"Private key: {key_path}")
+            print(f"CSR: {csr_path}")
+        except Exception as exc:
+            logger.error(f"CSR generation failed: {exc}")
+            print(f"CSR generation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "client" and args.client_command == "request-cert":
+        from .logger import setup_logger
+        from .client import request_certificate
+        logger = setup_logger(args.log_file)
+        _validate_existing_readable_file(args.csr, "--csr", [])
+        try:
+            out = request_certificate(args.csr, args.template, args.ca_url, args.out_cert, args.api_key, logger)
+            print(f"Certificate: {out}")
+        except Exception as exc:
+            logger.error(str(exc))
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "client" and args.client_command == "validate":
+        from .logger import setup_logger
+        from .client import validate_certificate_chain, check_certificate_status, format_validation_result
+        logger = setup_logger(args.log_file)
+        try:
+            result = validate_certificate_chain(args.cert, args.untrusted, args.trusted, args.purpose, _parse_validation_time(args.validation_time))
+            print(format_validation_result(result, args.format))
+            if result.ok and args.mode == "full":
+                ca_cert = args.ca_cert or (args.untrusted[0] if args.untrusted else None)
+                if ca_cert and (args.crl or args.ocsp or args.ocsp_url):
+                    status = check_certificate_status(args.cert, ca_cert, crl=args.crl, ocsp_url=args.ocsp_url, logger=logger)
+                    print(f"Revocation status: {status.status} via {status.source}")
+                    if status.status == "revoked":
+                        sys.exit(1)
+                    if status.status == "unknown" and args.mode == "full":
+                        sys.exit(1)
+            sys.exit(0 if result.ok else 1)
+        except Exception as exc:
+            logger.error(f"Validation failed: {exc}")
+            print(f"Validation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.command == "client" and args.client_command == "check-status":
+        from .logger import setup_logger
+        from .client import check_certificate_status
+        logger = setup_logger(args.log_file)
+        try:
+            status = check_certificate_status(args.cert, args.ca_cert, crl=args.crl, ocsp_url=args.ocsp_url, logger=logger)
+            print(f"{status.status} via {status.source}")
+            if status.reason:
+                print(f"Reason: {status.reason}")
+            if status.revocation_time:
+                print(f"Revocation time: {status.revocation_time}")
+            if status.detail:
+                print(status.detail)
+            sys.exit(0 if status.status == "good" else 1 if status.status == "revoked" else 2)
+        except Exception as exc:
+            logger.error(f"Status check failed: {exc}")
+            print(f"Status check failed: {exc}", file=sys.stderr)
+            sys.exit(2)
         return
 
     parser.print_help()

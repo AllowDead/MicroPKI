@@ -352,7 +352,7 @@ def issue_cert(args, logger):
         serialize_cert_to_pem,
     )
     from .crypto_utils import name_to_string, parse_dn
-    from .csr import load_csr_pem, verify_csr_signature
+    from .csr import csr_sans, load_csr_pem, verify_csr_signature
     from .database import certificate_insertion_transaction, certificate_to_record
     from .serial import generate_unique_serial
     from .templates import parse_san_entries, validate_template_sans
@@ -367,23 +367,25 @@ def issue_cert(args, logger):
         raise SystemExit(1)
 
     try:
-        subject = parse_dn(args.subject)
-        san_names = parse_san_entries(args.san or [])
-        validate_template_sans(args.template, san_names)
-
         if args.csr:
             csr = load_csr_pem(args.csr)
             verify_csr_signature(csr)
             try:
                 bc = csr.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
                 if bc.ca:
-                    logger.warning("CSR requests CA=TRUE; overriding/rejecting for end-entity certificate.")
+                    logger.warning("CSR requests CA=TRUE; rejecting for end-entity certificate.")
                     raise ValueError("CSR с CA=TRUE нельзя подписывать как end-entity сертификат")
             except x509.ExtensionNotFound:
                 pass
+            subject = csr.subject
+            san_names = csr_sans(csr)
+            validate_template_sans(args.template, san_names)
             public_key = csr.public_key()
             private_key = None
         else:
+            subject = parse_dn(args.subject)
+            san_names = parse_san_entries(args.san or [])
+            validate_template_sans(args.template, san_names)
             private_key = generate_end_entity_key("rsa", 2048)
             public_key = private_key.public_key()
 
@@ -437,6 +439,7 @@ def issue_cert(args, logger):
     print(f"Certificate: {cert_path}")
     if private_key is not None:
         print(f"Private key: {key_path}")
+    return {"cert_path": cert_path, "key_path": key_path if private_key is not None else None, "cert_pem": cert_pem, "serial_hex": record.serial_hex}
 
 
 def issue_ocsp_cert(args, logger):
