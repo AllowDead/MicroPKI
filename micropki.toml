@@ -1,0 +1,17 @@
+# MicroPKI Sprint 7 sample configuration
+[audit]
+log_file = "./pki/audit/audit.log"
+chain_file = "./pki/audit/chain.dat"
+
+[rate_limit]
+requests_per_second = 5
+burst = 10
+
+[transparency]
+ct_log = "./pki/audit/ct.log"
+
+[policy]
+max_root_validity_days = 3650
+max_intermediate_validity_days = 1825
+max_end_entity_validity_days = 365
+reject_wildcards = true

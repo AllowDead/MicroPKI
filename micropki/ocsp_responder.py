@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from .certificates import load_certificate
 from .database import init_database
 from .ocsp import load_ocsp_private_key, process_ocsp_request, validate_ocsp_signer_certificate
+from .ratelimit import TokenBucketRateLimiter
 
 
 class MicroPKIThreadingHTTPServer(ThreadingHTTPServer):
@@ -18,9 +19,18 @@ class MicroPKIThreadingHTTPServer(ThreadingHTTPServer):
     def shutdown(self):
         # BaseServer.shutdown can block forever in rare test races if called
         # while serve_forever is not fully inside its loop. Bound it.
+        self._micropki_shutdown_requested = True
         t = threading.Thread(target=super().shutdown, daemon=True)
         t.start()
         t.join(timeout=2)
+
+    def server_close(self):
+        # On Windows, closing the listening socket while serve_forever() is still
+        # polling it can raise WinError 10038 in the background thread. Make
+        # server_close() safe for tests and callers that forgot shutdown().
+        if not getattr(self, "_micropki_shutdown_requested", False):
+            self.shutdown()
+        super().server_close()
 
 class OCSPRequestHandler(BaseHTTPRequestHandler):
     server_version = "MicroPKIOCSP/0.5"
@@ -31,6 +41,26 @@ class OCSPRequestHandler(BaseHTTPRequestHandler):
     @property
     def ocsp_logger(self):
         return getattr(self.server, "ocsp_logger", None)
+
+    def _rate_limit_exceeded(self) -> bool:
+        limiter = getattr(self.server, "rate_limiter", None)
+        if not limiter:
+            return False
+        allowed, retry_after = limiter.allow(self.client_address[0])
+        if allowed:
+            return False
+        body = b"Too Many Requests"
+        self.send_response(429)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        if self.ocsp_logger:
+            self.ocsp_logger.warning(f"Rate limit exceeded: client_ip={self.client_address[0]}, path={self.path}")
+        return True
 
     def _send_bytes(self, status: int, body: bytes, content_type: str = "application/ocsp-response") -> None:
         self.send_response(status)
@@ -45,6 +75,8 @@ class OCSPRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(status, text.encode("utf-8"), "text/plain; charset=utf-8")
 
     def do_OPTIONS(self):
+        if self._rate_limit_exceeded():
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -52,9 +84,13 @@ class OCSPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self._rate_limit_exceeded():
+            return
         self._send_text(405, "OCSP responder accepts POST requests only")
 
     def do_POST(self):
+        if self._rate_limit_exceeded():
+            return
         parsed = urlparse(self.path)
         if parsed.path not in {"/", "/ocsp"}:
             self._send_text(404, "Not Found")
@@ -99,6 +135,8 @@ def create_ocsp_server(
     ca_cert_path: str,
     cache_ttl: int = 60,
     logger=None,
+    rate_limit: float = 0,
+    rate_burst: int = 10,
 ) -> ThreadingHTTPServer:
     init_database(db_path)
     responder_cert = load_certificate(responder_cert_path)
@@ -113,6 +151,7 @@ def create_ocsp_server(
     server.ca_cert = ca_cert
     server.cache_ttl = int(cache_ttl)
     server.ocsp_logger = logger
+    server.rate_limiter = TokenBucketRateLimiter(rate_limit, rate_burst)
     return server
 
 
@@ -125,6 +164,8 @@ def serve_ocsp(
     ca_cert_path: str,
     cache_ttl: int = 60,
     logger=None,
+    rate_limit: float = 0,
+    rate_burst: int = 10,
 ) -> None:
     server = create_ocsp_server(
         host,
@@ -135,11 +176,13 @@ def serve_ocsp(
         ca_cert_path,
         cache_ttl,
         logger,
+        rate_limit=rate_limit,
+        rate_burst=rate_burst,
     )
     if logger:
         logger.info(
             f"OCSP responder listening on {host}:{port}; db={os.path.abspath(db_path)}; "
-            f"responder_cert={os.path.abspath(responder_cert_path)}; ca_cert={os.path.abspath(ca_cert_path)}"
+            f"responder_cert={os.path.abspath(responder_cert_path)}; ca_cert={os.path.abspath(ca_cert_path)}; rate_limit={rate_limit}; rate_burst={rate_burst}"
         )
     try:
         server.serve_forever()

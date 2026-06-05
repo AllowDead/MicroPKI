@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .crypto_utils import name_to_string
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_STATUSES = {"valid", "revoked", "expired"}
 _SERIAL_RE = re.compile(r"^[0-9A-Fa-f]+$")
 
@@ -126,11 +126,24 @@ def init_database(db_path: str = "./pki/micropki.db") -> str:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS compromised_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_key_hash TEXT UNIQUE NOT NULL,
+                certificate_serial TEXT NOT NULL,
+                compromise_date TEXT NOT NULL,
+                compromise_reason TEXT NOT NULL,
+                FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+            )
+            """
+        )
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_serial_hex ON certificates(serial_hex)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_status ON certificates(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_issuer ON certificates(issuer)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_certificates_not_after ON certificates(not_after)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_compromised_keys_hash ON compromised_keys(public_key_hash)")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_now_iso()),
@@ -441,3 +454,48 @@ def format_records(records: Iterable[dict], output_format: str) -> str:
         writer.writerows(rows)
         return out.getvalue().rstrip("\n")
     raise ValueError("format must be one of: table, json, csv")
+
+
+def mark_key_compromised(db_path: str, public_key_hash: str, certificate_serial: str, reason: str) -> None:
+    """Record a compromised public key hash for future issuance blocking."""
+    serial_hex = normalize_serial_hex(certificate_serial)
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO compromised_keys(public_key_hash, certificate_serial, compromise_date, compromise_reason)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(public_key_hash) DO UPDATE SET
+                certificate_serial = excluded.certificate_serial,
+                compromise_date = excluded.compromise_date,
+                compromise_reason = excluded.compromise_reason
+            """,
+            (public_key_hash, serial_hex, utc_now_iso(), reason),
+        )
+
+
+def compromised_key_exists(db_path: str, public_key_hash: str) -> bool:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM compromised_keys WHERE public_key_hash = ? LIMIT 1",
+            (public_key_hash,),
+        ).fetchone()
+    return row is not None
+
+
+def get_compromised_key(db_path: str, public_key_hash: str) -> Optional[dict]:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM compromised_keys WHERE public_key_hash = ?",
+            (public_key_hash,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def list_compromised_keys(db_path: str) -> list[dict]:
+    init_database(db_path)
+    with _connection(db_path) as conn:
+        rows = conn.execute("SELECT * FROM compromised_keys ORDER BY compromise_date, id").fetchall()
+    return [_row_to_dict(row) for row in rows]

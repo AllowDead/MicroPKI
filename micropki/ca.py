@@ -61,6 +61,25 @@ def _db_path_for_args(args):
     return _infer_db_path_from_out_dir(getattr(args, "out_dir", "./pki"))
 
 
+def _pki_root_for_args(args):
+    out_dir = os.path.abspath(getattr(args, "out_dir", "./pki"))
+    if os.path.basename(out_dir).lower() in {"certs", "private", "csrs", "crl", "ocsp"}:
+        return os.path.dirname(out_dir)
+    return out_dir
+
+
+def _audit_for_args(args):
+    from .audit import get_audit_logger
+    return get_audit_logger(_pki_root_for_args(args))
+
+
+def _audit_event(args, operation, status, message, level="AUDIT", metadata=None):
+    try:
+        _audit_for_args(args).log_event(operation, status, message, level=level, metadata=metadata or {})
+    except Exception:
+        pass
+
+
 def _cleanup_paths(paths):
     for path in paths:
         try:
@@ -79,8 +98,18 @@ def init_ca(args, logger):
     validity_days = args.validity_days
     force = args.force
 
+    _audit_event(args, "ca_init", "started", "Root CA initialisation started", metadata={"subject": subject_name, "key_type": key_type, "key_size": key_size})
+
     from .certificates import generate_key, build_ca_certificate, serialize_cert_to_pem
     from .crypto_utils import parse_dn
+    from .policy import enforce_private_key, enforce_validity
+
+    try:
+        enforce_validity("root", validity_days)
+    except ValueError as exc:
+        logger.error(str(exc))
+        _audit_event(args, "policy_violation", "failure", str(exc), metadata={"operation": "ca_init", "subject": subject_name})
+        raise SystemExit(1)
 
     private_dir = os.path.join(out_dir, "private")
     certs_dir = os.path.join(out_dir, "certs")
@@ -108,6 +137,12 @@ def init_ca(args, logger):
 
     logger.info("Начало генерации закрытого ключа...")
     private_key = generate_key(key_type, key_size)
+    try:
+        enforce_private_key(private_key, "root")
+    except ValueError as exc:
+        logger.error(str(exc))
+        _audit_event(args, "policy_violation", "failure", str(exc), metadata={"operation": "ca_init", "subject": subject_name})
+        raise SystemExit(1)
     logger.info("Успешное завершение генерации закрытого ключа.")
 
     logger.info("Начало подписания сертификата УЦ...")
@@ -178,8 +213,10 @@ def init_ca(args, logger):
     except Exception as exc:
         _cleanup_paths(created_paths)
         logger.error(f"Не удалось сохранить файлы Root CA или запись БД: {exc}")
+        _audit_event(args, "ca_init", "failure", f"Root CA initialisation failed: {exc}", metadata={"subject": subject_name})
         raise SystemExit(1)
 
+    _audit_event(args, "ca_init", "success", "Root CA initialisation completed", metadata={"serial": f"{cert.serial_number:X}", "subject": subject_name})
     logger.info("Инициализация УЦ успешно завершена.")
 
 
@@ -248,6 +285,10 @@ def issue_intermediate(args, logger):
     from .csr import generate_intermediate_csr, serialize_csr_to_pem, verify_csr_signature
     from .database import certificate_insertion_transaction, certificate_to_record
     from .serial import generate_unique_serial
+    from .policy import enforce_csr, enforce_pathlen_for_intermediate, enforce_private_key, enforce_validity
+    from .transparency import append_ct_entry
+
+    _audit_event(args, "issue_intermediate", "started", "Intermediate CA issuance started", metadata={"subject": args.subject, "pathlen": args.pathlen})
 
     out_dir = os.path.abspath(args.out_dir)
     db_path = _db_path_for_args(args)
@@ -270,11 +311,15 @@ def issue_intermediate(args, logger):
         raise SystemExit(1)
 
     try:
+        enforce_validity("intermediate", args.validity_days)
+        enforce_pathlen_for_intermediate(args.pathlen)
         subject = parse_dn(args.subject)
         intermediate_key = generate_key(args.key_type, args.key_size)
+        enforce_private_key(intermediate_key, "intermediate")
         logger.info("Generation of Intermediate CA CSR started.")
         csr = generate_intermediate_csr(subject, intermediate_key, args.pathlen)
         verify_csr_signature(csr)
+        enforce_csr(csr, "intermediate")
         logger.info("Generation of Intermediate CA CSR completed.")
 
         logger.info("Signing of Intermediate CA certificate by Root CA started.")
@@ -290,6 +335,8 @@ def issue_intermediate(args, logger):
         logger.info("Signing of Intermediate CA certificate by Root CA completed.")
     except Exception as exc:
         logger.error(f"Ошибка выпуска Intermediate CA: {exc}")
+        _audit_event(args, "issue_intermediate", "failure", f"Intermediate CA issuance failed: {exc}", metadata={"subject": args.subject})
+        _audit_event(args, "policy_violation", "failure", str(exc), metadata={"operation": "issue_intermediate", "subject": args.subject})
         raise SystemExit(1)
 
     key_path = os.path.join(private_dir, "intermediate.key.pem")
@@ -336,6 +383,11 @@ Issuer DN: {name_to_string(root_cert.subject)}
         logger.error(f"Не удалось сохранить файлы Intermediate CA или запись БД: {exc}")
         raise SystemExit(1)
 
+    try:
+        append_ct_entry(cert, pki_root=_pki_root_for_args(args))
+    except Exception as exc:
+        logger.warning(f"CT log append failed: {exc}")
+    _audit_event(args, "issue_intermediate", "success", "Intermediate CA certificate issued", metadata={"serial": record.serial_hex, "subject": record.subject})
     logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
     logger.info(f"Intermediate CA key saved: {os.path.abspath(key_path)}")
     logger.info(f"Intermediate CA certificate saved: {os.path.abspath(cert_path)}")
@@ -353,9 +405,13 @@ def issue_cert(args, logger):
     )
     from .crypto_utils import name_to_string, parse_dn
     from .csr import csr_sans, load_csr_pem, verify_csr_signature
-    from .database import certificate_insertion_transaction, certificate_to_record
+    from .database import certificate_insertion_transaction, certificate_to_record, compromised_key_exists
     from .serial import generate_unique_serial
-    from .templates import parse_san_entries, validate_template_sans
+    from .templates import parse_san_entries
+    from .policy import enforce_csr, enforce_public_key, enforce_template_policy, enforce_validity, public_key_hash
+    from .transparency import append_ct_entry
+
+    _audit_event(args, "issue_certificate", "started", "End-entity certificate issuance started", metadata={"template": args.template, "subject": getattr(args, "subject", None)})
 
     os.makedirs(args.out_dir, exist_ok=True)
     db_path = _db_path_for_args(args)
@@ -367,9 +423,11 @@ def issue_cert(args, logger):
         raise SystemExit(1)
 
     try:
+        enforce_validity("end_entity", args.validity_days)
         if args.csr:
             csr = load_csr_pem(args.csr)
             verify_csr_signature(csr)
+            enforce_csr(csr, "end_entity")
             try:
                 bc = csr.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
                 if bc.ca:
@@ -379,15 +437,20 @@ def issue_cert(args, logger):
                 pass
             subject = csr.subject
             san_names = csr_sans(csr)
-            validate_template_sans(args.template, san_names)
+            enforce_template_policy(args.template, san_names)
             public_key = csr.public_key()
             private_key = None
         else:
             subject = parse_dn(args.subject)
             san_names = parse_san_entries(args.san or [])
-            validate_template_sans(args.template, san_names)
+            enforce_template_policy(args.template, san_names)
             private_key = generate_end_entity_key("rsa", 2048)
             public_key = private_key.public_key()
+            enforce_public_key(public_key, "end_entity")
+
+        key_hash = public_key_hash(public_key)
+        if compromised_key_exists(db_path, key_hash):
+            raise ValueError("Policy violation: public key is marked as compromised")
 
         serial_number = generate_unique_serial(db_path)
         cert = build_end_entity_certificate(
@@ -402,6 +465,9 @@ def issue_cert(args, logger):
         )
     except Exception as exc:
         logger.error(f"Ошибка выпуска конечного сертификата: {exc}")
+        _audit_event(args, "issue_certificate", "failure", f"End-entity certificate issuance failed: {exc}", metadata={"template": args.template, "subject": getattr(args, "subject", None)})
+        if "Policy violation" in str(exc) or "certificate" in str(exc):
+            _audit_event(args, "policy_violation", "failure", str(exc), metadata={"operation": "issue_certificate", "template": args.template})
         raise SystemExit(1)
 
     base = _safe_basename_from_subject(subject)
@@ -431,6 +497,11 @@ def issue_cert(args, logger):
 
     san_text = ",".join(args.san or [])
     issued_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    try:
+        append_ct_entry(cert, pki_root=_pki_root_for_args(args))
+    except Exception as exc:
+        logger.warning(f"CT log append failed: {exc}")
+    _audit_event(args, "issue_certificate", "success", "End-entity certificate issued", metadata={"serial": record.serial_hex, "subject": record.subject, "template": args.template})
     logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
     logger.info(
         f"Successful issuance of an end-entity certificate: template={args.template}, "
@@ -454,6 +525,10 @@ def issue_ocsp_cert(args, logger):
     from .database import certificate_insertion_transaction, certificate_to_record
     from .serial import generate_unique_serial
     from .templates import parse_san_entries
+    from .policy import enforce_private_key, enforce_template_policy, enforce_validity
+    from .transparency import append_ct_entry
+
+    _audit_event(args, "issue_ocsp_certificate", "started", "OCSP responder certificate issuance started", metadata={"subject": args.subject})
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -469,9 +544,12 @@ def issue_ocsp_cert(args, logger):
         raise SystemExit(1)
 
     try:
+        enforce_validity("ocsp", args.validity_days)
         subject = parse_dn(args.subject)
         san_names = parse_san_entries(args.san or [])
+        enforce_template_policy("code_signing", san_names, allow_wildcards=True)
         private_key = generate_end_entity_key(args.key_type, args.key_size)
+        enforce_private_key(private_key, "ocsp")
         serial_number = generate_unique_serial(db_path)
         cert = build_ocsp_responder_certificate(
             subject=subject,
@@ -484,6 +562,7 @@ def issue_ocsp_cert(args, logger):
         )
     except Exception as exc:
         logger.error(f"Ошибка выпуска OCSP responder certificate: {exc}")
+        _audit_event(args, "issue_ocsp_certificate", "failure", f"OCSP responder certificate issuance failed: {exc}", metadata={"subject": args.subject})
         raise SystemExit(1)
 
     cert_path = os.path.join(out_dir, "ocsp.cert.pem")
@@ -507,6 +586,11 @@ def issue_ocsp_cert(args, logger):
         logger.error(f"Не удалось сохранить OCSP certificate/key или запись БД: {exc}")
         raise SystemExit(1)
 
+    try:
+        append_ct_entry(cert, pki_root=_pki_root_for_args(args))
+    except Exception as exc:
+        logger.warning(f"CT log append failed: {exc}")
+    _audit_event(args, "issue_ocsp_certificate", "success", "OCSP responder certificate issued", metadata={"serial": record.serial_hex, "subject": record.subject})
     logger.warning(f"OCSP responder private key is stored unencrypted: {os.path.abspath(key_path)}")
     logger.info(f"Certificate insertion completed: serial={record.serial_hex}, subject={record.subject}")
     logger.info(

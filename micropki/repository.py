@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from cryptography import x509
 
 from .database import get_certificate_by_serial, normalize_serial_hex
+from .ratelimit import TokenBucketRateLimiter
 
 _SERIAL_RE = re.compile(r"^[0-9A-Fa-f]+$")
 
@@ -23,9 +24,18 @@ class MicroPKIThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def shutdown(self):
+        self._micropki_shutdown_requested = True
         t = threading.Thread(target=super().shutdown, daemon=True)
         t.start()
         t.join(timeout=2)
+
+    def server_close(self):
+        # On Windows, closing the listening socket while serve_forever() is still
+        # polling it can raise WinError 10038 in the background thread. Make
+        # server_close() safe for tests and callers that forgot shutdown().
+        if not getattr(self, "_micropki_shutdown_requested", False):
+            self.shutdown()
+        super().server_close()
 
 class RepositoryRequestHandler(BaseHTTPRequestHandler):
     server_version = "MicroPKIRepository/0.4"
@@ -48,6 +58,28 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
     @property
     def crl_dir(self):
         return getattr(self.server, "crl_dir")
+
+    def _rate_limit_exceeded(self) -> bool:
+        limiter = getattr(self.server, "rate_limiter", None)
+        if not limiter:
+            return False
+        allowed, retry_after = limiter.allow(self.client_address[0])
+        if allowed:
+            return False
+        self.send_response(429)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        body = b"Too Many Requests"
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        logger = self.repo_logger
+        if logger:
+            logger.warning(f"Rate limit exceeded: client_ip={self.client_address[0]}, path={self.path}")
+        self._log_request(429)
+        return True
 
     def _log_request(self, status: int) -> None:
         logger = self.repo_logger
@@ -77,6 +109,8 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(status, text.encode("utf-8"), content_type)
 
     def do_OPTIONS(self):
+        if self._rate_limit_exceeded():
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
@@ -88,6 +122,8 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
         return self.do_GET()
 
     def do_GET(self):
+        if self._rate_limit_exceeded():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") if parsed.path != "/" else parsed.path
         if path.startswith("/certificate/"):
@@ -106,15 +142,21 @@ class RepositoryRequestHandler(BaseHTTPRequestHandler):
         return self._send_text(404, "Not Found")
 
     def do_POST(self):
+        if self._rate_limit_exceeded():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/request-cert":
             return self._handle_request_cert(parsed)
         self._send_text(405, "Method Not Allowed")
 
     def do_PUT(self):
+        if self._rate_limit_exceeded():
+            return
         self._send_text(405, "Method Not Allowed")
 
     def do_DELETE(self):
+        if self._rate_limit_exceeded():
+            return
         self._send_text(405, "Method Not Allowed")
 
     def _handle_request_cert(self, parsed):
@@ -242,6 +284,8 @@ def create_repository_server(
     ca_pass_file: str | None = None,
     api_key: str | None = None,
     default_validity_days: int = 365,
+    rate_limit: float = 0,
+    rate_burst: int = 10,
 ) -> ThreadingHTTPServer:
     server = MicroPKIThreadingHTTPServer((host, int(port)), RepositoryRequestHandler)
     server.db_path = os.path.abspath(db_path)
@@ -253,6 +297,7 @@ def create_repository_server(
     server.ca_pass_file = os.path.abspath(ca_pass_file) if ca_pass_file else None
     server.api_key = api_key
     server.default_validity_days = default_validity_days
+    server.rate_limiter = TokenBucketRateLimiter(rate_limit, rate_burst)
     return server
 
 
@@ -268,6 +313,8 @@ def serve_repository(
     ca_pass_file: str | None = None,
     api_key: str | None = None,
     default_validity_days: int = 365,
+    rate_limit: float = 0,
+    rate_burst: int = 10,
 ) -> None:
     from .database import init_database
 
@@ -276,11 +323,12 @@ def serve_repository(
         host, port, db_path, cert_dir, logger, crl_dir,
         ca_cert_path=ca_cert_path, ca_key_path=ca_key_path, ca_pass_file=ca_pass_file,
         api_key=api_key, default_validity_days=default_validity_days,
+        rate_limit=rate_limit, rate_burst=rate_burst,
     )
     if logger:
         logger.info(
             f"Repository server listening on {host}:{port}; db={os.path.abspath(db_path)}; "
-            f"cert_dir={os.path.abspath(cert_dir)}; crl_dir={server.crl_dir}"
+            f"cert_dir={os.path.abspath(cert_dir)}; crl_dir={server.crl_dir}; rate_limit={rate_limit}; rate_burst={rate_burst}"
         )
     try:
         server.serve_forever()

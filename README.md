@@ -34,7 +34,7 @@ micropki ca init \
   --key-size 4096 \
   --passphrase-file ./secrets/root.pass \
   --out-dir ./pki \
-  --validity-days 7300 \
+  --validity-days 3650 \
   --log-file ./logs/ca-init.log
 ```
 
@@ -805,3 +805,167 @@ micropki/
 ```
 
 `validation.py` contains custom simplified RFC 5280 path building and validation. `revocation_check.py` contains CRL and OCSP client checks with fallback. `client.py` contains CSR generation, certificate request, validation and status-check helper functions.
+
+
+## Sprint 7: security hardening, audit and policy enforcement
+
+Sprint 7 hardens MicroPKI with structured audit logging, hash-chain integrity checks, certificate policy enforcement, compromise simulation, Certificate Transparency simulation and optional HTTP rate limiting.
+
+### Audit log
+
+Security-sensitive operations write NDJSON audit entries to `./pki/audit/audit.log`. Each line is one JSON object with `timestamp`, `level`, `operation`, `status`, `message`, `metadata` and `integrity`. The `integrity` object contains `prev_hash` and `hash`. `chain.dat` stores the hash chain so the log can be checked for modified, deleted or reordered entries.
+
+Verify the full audit log:
+
+```bash
+micropki audit verify \
+  --log-file ./pki/audit/audit.log \
+  --chain-file ./pki/audit/chain.dat
+```
+
+Query audit entries:
+
+```bash
+micropki audit query \
+  --operation issue \
+  --level AUDIT \
+  --format table \
+  --verify
+```
+
+Supported filters are `--from`, `--to`, `--level`, `--operation`, `--serial`, `--format table|json|csv` and `--verify`. If `--verify` detects tampering, the command exits with a non-zero status.
+
+### Certificate policy enforcement
+
+The CA now blocks policy violations before issuing a certificate. Blocked operations are audited with `operation=policy_violation`.
+
+Mandatory defaults:
+
+- Root CA: RSA at least 4096 bits or ECC P-384; maximum validity 3650 days.
+- Intermediate CA: RSA at least 3072 bits or ECC P-384; maximum validity 1825 days; `pathLen=0`.
+- End-entity certificates: RSA at least 2048 bits or ECC P-256; maximum validity 365 days.
+- Server SANs: only `dns` and `ip`; wildcard DNS such as `dns:*.example.com` is rejected by default.
+- Client SANs: `email` and `dns` are allowed.
+- Code-signing SANs: only `dns` and `uri`; `email` and `ip` are rejected.
+- CSR signatures must use SHA-256 or stronger; SHA-1 is rejected.
+
+Examples of blocked requests:
+
+```bash
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --subject "CN=wild.example.com,O=MicroPKI" \
+  --san dns:*.example.com \
+  --out-dir ./pki/certs
+
+micropki ca issue-cert \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass \
+  --template server \
+  --subject "CN=long.example.com,O=MicroPKI" \
+  --san dns:long.example.com \
+  --validity-days 366
+```
+
+### Certificate Transparency simulation
+
+Every issued certificate is appended to `./pki/audit/ct.log`. Each line contains timestamp, certificate serial, subject DN, SHA-256 fingerprint and issuer DN. This is a simple append-only simulation, not a Merkle-tree CT implementation.
+
+Check certificate inclusion:
+
+```bash
+micropki audit ct-verify \
+  --cert ./pki/certs/example.com.cert.pem \
+  --ct-log ./pki/audit/ct.log
+```
+
+### Private key compromise simulation
+
+Use `ca compromise` to simulate a compromised private key. The command revokes the certificate with reason `keyCompromise`, writes a high-severity audit event and stores the public-key hash in the `compromised_keys` table. Future CSRs using the same public key are blocked.
+
+```bash
+micropki ca compromise \
+  --cert ./pki/certs/example.com.cert.pem \
+  --reason keyCompromise \
+  --force
+```
+
+Optional emergency CRL generation:
+
+```bash
+micropki ca compromise \
+  --cert ./pki/certs/example.com.cert.pem \
+  --reason keyCompromise \
+  --force \
+  --crl ./pki/crl/intermediate.crl.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --ca-key ./pki/private/intermediate.key.pem \
+  --ca-pass-file ./secrets/intermediate.pass
+```
+
+### HTTP rate limiting
+
+`repo serve` and `ocsp serve` support per-client-IP token-bucket rate limiting. When a client exceeds the limit, the server returns HTTP `429 Too Many Requests` and a `Retry-After` header.
+
+```bash
+micropki repo serve \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --rate-limit 5 \
+  --rate-burst 10
+```
+
+```bash
+micropki ocsp serve \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --db-path ./pki/micropki.db \
+  --responder-cert ./pki/certs/ocsp.cert.pem \
+  --responder-key ./pki/certs/ocsp.key.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --rate-limit 10 \
+  --rate-burst 20
+```
+
+### Configuration file
+
+A sample `micropki.toml` is included. The CLI accepts a global `--config` argument before the command name:
+
+```bash
+micropki --config ./micropki.toml repo serve --host 0.0.0.0 --port 8080
+```
+
+Supported configuration sections are `audit`, `rate_limit`, `transparency` and `policy`. The current implementation applies audit paths, CT log path and rate-limit defaults; mandatory policy checks remain enforced in code so unsafe defaults cannot silently weaken the CA.
+
+Example:
+
+```toml
+[audit]
+log_file = "./pki/audit/audit.log"
+chain_file = "./pki/audit/chain.dat"
+
+[rate_limit]
+requests_per_second = 5
+burst = 10
+
+[transparency]
+ct_log = "./pki/audit/ct.log"
+
+[policy]
+max_root_validity_days = 3650
+max_intermediate_validity_days = 1825
+max_end_entity_validity_days = 365
+reject_wildcards = true
+```
+
+### Sprint 7 tests
+
+The Sprint 7 test suite covers audit hash-chain tamper detection, audit filtering, validity and wildcard policy rejection, CT log inclusion, compromise tracking and blocking, and repository rate limiting.
+
+```bash
+pytest tests/test_sprint7.py
+```

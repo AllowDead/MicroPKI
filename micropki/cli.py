@@ -381,6 +381,7 @@ def _check_repo_status(host, port):
 
 def main():
     parser = argparse.ArgumentParser(prog="micropki", description="MicroPKI Utility")
+    parser.add_argument("--config", help="Optional config file (JSON or simple TOML) for audit/rate-limit settings")
     subparsers = parser.add_subparsers(dest="command")
 
     ca_parser = subparsers.add_parser("ca", help="Operations with Certificate Authority")
@@ -471,6 +472,19 @@ def main():
     _add_db_path_arg(revoke_parser)
     revoke_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
+    compromise_parser = ca_subparsers.add_parser("compromise", help="Simulate private key compromise and revoke certificate")
+    compromise_parser.add_argument("--cert", required=True, help="Path to compromised certificate PEM")
+    compromise_parser.add_argument("--reason", default="keyCompromise", help="Revocation reason code (default: keyCompromise)")
+    compromise_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    compromise_parser.add_argument("--out-dir", default="./pki", help="PKI output directory used for audit/CRL paths")
+    compromise_parser.add_argument("--crl", help="Optional emergency CRL output path")
+    compromise_parser.add_argument("--next-update", type=int, default=7, help="Emergency CRL nextUpdate interval in days")
+    compromise_parser.add_argument("--ca-cert", help="CA certificate PEM used to regenerate emergency CRL")
+    compromise_parser.add_argument("--ca-key", help="CA private key PEM used to regenerate emergency CRL")
+    compromise_parser.add_argument("--ca-pass-file", help="CA private key passphrase file used to regenerate emergency CRL")
+    _add_db_path_arg(compromise_parser)
+    compromise_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
     gen_crl_parser = ca_subparsers.add_parser("gen-crl", help="Generate a CRL for Root or Intermediate CA")
     gen_crl_parser.add_argument("--ca", required=True, help="root, intermediate, or path to a CA certificate")
     gen_crl_parser.add_argument("--next-update", type=int, default=7, help="Days until next CRL update")
@@ -486,6 +500,27 @@ def main():
     check_parser.add_argument("serial", help="Certificate serial number in hexadecimal")
     _add_db_path_arg(check_parser)
     check_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    audit_parser = subparsers.add_parser("audit", help="Audit log operations")
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_command")
+    audit_query_parser = audit_subparsers.add_parser("query", help="Search and display audit log entries")
+    audit_query_parser.add_argument("--from", dest="from_ts", help="Start timestamp (ISO 8601)")
+    audit_query_parser.add_argument("--to", dest="to_ts", help="End timestamp (ISO 8601)")
+    audit_query_parser.add_argument("--level", choices=["INFO", "WARNING", "ERROR", "AUDIT"], help="Log level")
+    audit_query_parser.add_argument("--operation", help="Operation filter, e.g. issue, revoke, ca_init")
+    audit_query_parser.add_argument("--serial", help="Certificate serial filter")
+    audit_query_parser.add_argument("--format", choices=["table", "json", "csv"], default="table")
+    audit_query_parser.add_argument("--verify", action="store_true", help="Verify audit hash chain before returning results")
+    audit_query_parser.add_argument("--log-file", default="./pki/audit/audit.log", help="Audit log path")
+    audit_query_parser.add_argument("--chain-file", default="./pki/audit/chain.dat", help="Audit chain path")
+
+    audit_verify_parser = audit_subparsers.add_parser("verify", help="Verify full audit log integrity")
+    audit_verify_parser.add_argument("--log-file", default="./pki/audit/audit.log", help="Audit log path")
+    audit_verify_parser.add_argument("--chain-file", default="./pki/audit/chain.dat", help="Audit chain path")
+
+    audit_ct_parser = audit_subparsers.add_parser("ct-verify", help="Check whether a certificate is present in the CT simulation log")
+    audit_ct_parser.add_argument("--cert", required=True, help="Certificate PEM path")
+    audit_ct_parser.add_argument("--ct-log", default="./pki/audit/ct.log", help="CT log path")
 
     db_parser = subparsers.add_parser("db", help="Database operations")
     db_subparsers = db_parser.add_subparsers(dest="db_command")
@@ -506,6 +541,8 @@ def main():
     serve_parser.add_argument("--ca-pass-file", help="Issuer CA passphrase file for POST /request-cert")
     serve_parser.add_argument("--api-key", help="Optional pre-shared key required in X-API-Key for POST /request-cert")
     serve_parser.add_argument("--default-validity-days", type=int, default=365, help="Default validity for certificates issued via API")
+    serve_parser.add_argument("--rate-limit", type=float, default=0, help="Requests per second per client IP (0 = disabled)")
+    serve_parser.add_argument("--rate-burst", type=int, default=10, help="Rate-limit burst allowance")
     serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     status_parser = repo_subparsers.add_parser("status", help="Check whether a repository port is accepting TCP connections")
@@ -522,6 +559,8 @@ def main():
     ocsp_serve_parser.add_argument("--responder-key", required=True, help="OCSP signing private key PEM, unencrypted")
     ocsp_serve_parser.add_argument("--ca-cert", required=True, help="Issuer CA certificate PEM")
     ocsp_serve_parser.add_argument("--cache-ttl", type=int, default=60, help="OCSP response cache TTL / nextUpdate seconds")
+    ocsp_serve_parser.add_argument("--rate-limit", type=float, default=0, help="Requests per second per client IP (0 = disabled)")
+    ocsp_serve_parser.add_argument("--rate-burst", type=int, default=10, help="Rate-limit burst allowance")
     ocsp_serve_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     client_parser = subparsers.add_parser("client", help="Client-side CSR, validation and revocation tools")
@@ -566,6 +605,42 @@ def main():
     check_status_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
     args = parser.parse_args()
+    try:
+        from .config import apply_config
+        apply_config(args)
+    except Exception as exc:
+        print(f"Config loading failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == "audit" and args.audit_command == "query":
+        from .audit import format_entries, query_entries, verify_log
+        if args.verify:
+            ok, msg, _ = verify_log(args.log_file, args.chain_file)
+            if not ok:
+                print(msg, file=sys.stderr)
+                sys.exit(2)
+        entries = query_entries(
+            args.log_file,
+            start=args.from_ts,
+            end=args.to_ts,
+            level=args.level,
+            operation=args.operation,
+            serial=args.serial,
+        )
+        print(format_entries(entries, args.format))
+        return
+
+    if args.command == "audit" and args.audit_command == "verify":
+        from .audit import verify_log
+        ok, msg, _ = verify_log(args.log_file, args.chain_file)
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        sys.exit(0 if ok else 2)
+
+    if args.command == "audit" and args.audit_command == "ct-verify":
+        from .transparency import certificate_in_ct_log
+        ok = certificate_in_ct_log(args.cert, args.ct_log)
+        print("present" if ok else "not found")
+        sys.exit(0 if ok else 1)
 
     if args.command == "ca" and args.ca_command == "init":
         from .logger import setup_logger
@@ -643,15 +718,58 @@ def main():
         _print_show_cert(args.db_path, args.serial, logger)
         return
 
+    if args.command == "ca" and args.ca_command == "compromise":
+        from .logger import setup_logger
+        from .audit import get_audit_logger
+        from .compromise import compromise_certificate
+        logger = setup_logger(args.log_file)
+        errors = []
+        _validate_existing_readable_file(args.cert, "--cert", errors)
+        _validate_db_parent(getattr(args, "db_path", DEFAULT_DB_PATH), errors)
+        if args.ca_cert:
+            _validate_existing_readable_file(args.ca_cert, "--ca-cert", errors)
+        if args.ca_key:
+            _validate_existing_readable_file(args.ca_key, "--ca-key", errors)
+        if args.ca_pass_file:
+            _validate_existing_readable_file(args.ca_pass_file, "--ca-pass-file", errors)
+        if errors:
+            for err in errors:
+                logger.error(err)
+            sys.exit(1)
+        audit = get_audit_logger(args.out_dir)
+        audit.log_event("private_key_compromise", "started", "Private key compromise simulation started", metadata={"cert": args.cert, "reason": args.reason})
+        try:
+            result = compromise_certificate(args.db_path, args.cert, args.reason, force=args.force, logger=logger)
+            if args.crl:
+                if not args.ca_cert or not args.ca_key or not args.ca_pass_file:
+                    logger.warning("--crl was supplied but --ca-cert, --ca-key and --ca-pass-file are required to regenerate a signed CRL.")
+                else:
+                    from .crl import generate_crl
+                    generate_crl(args.db_path, args.ca_cert, args.ca_key, load_passphrase(args.ca_pass_file), args.crl, args.next_update, logger)
+                    print(f"Emergency CRL: {args.crl}")
+            audit.log_event("private_key_compromise", "success", "Private key compromise simulated and certificate revoked", metadata={"serial": result["serial_hex"], "public_key_hash": result["public_key_hash"]})
+            print(f"{result['serial_hex']}: revoked keyCompromise")
+            print(f"Compromised key hash: {result['public_key_hash']}")
+        except Exception as exc:
+            audit.log_event("private_key_compromise", "failure", f"Private key compromise simulation failed: {exc}", metadata={"cert": args.cert})
+            logger.error(f"Compromise simulation failed: {exc}")
+            print(f"Compromise simulation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     if args.command == "ca" and args.ca_command == "revoke":
         from .logger import setup_logger
         from .revocation import revoke_by_serial, normalize_reason
         logger = setup_logger(args.log_file)
         validate_revoke_args(args, logger)
+        from .audit import get_audit_logger
+        audit = get_audit_logger(args.out_dir)
+        audit.log_event("revoke_certificate", "started", "Certificate revocation started", metadata={"serial": args.serial, "reason": args.reason})
         try:
             updated = revoke_by_serial(args.db_path, args.serial, normalize_reason(args.reason), force=args.force, logger=logger)
             if updated is None:
                 sys.exit(1)
+            audit.log_event("revoke_certificate", "success", "Certificate revoked", metadata={"serial": updated["serial_hex"], "reason": updated.get("revocation_reason")})
             print(f"{updated['serial_hex']}: {updated['status']}")
             if args.crl:
                 if not args.ca_cert or not args.ca_key or not args.ca_pass_file:
@@ -662,13 +780,16 @@ def main():
                     generate_crl(args.db_path, args.ca_cert, args.ca_key, passphrase, args.crl, args.next_update, logger)
                     print(f"CRL: {args.crl}")
         except PermissionError as exc:
+            audit.log_event("revoke_certificate", "failure", str(exc), metadata={"serial": args.serial})
             logger.error(str(exc))
             print(str(exc), file=sys.stderr)
             sys.exit(1)
         except KeyError as exc:
+            audit.log_event("revoke_certificate", "failure", str(exc).strip("'"), metadata={"serial": args.serial})
             print(str(exc).strip("'"), file=sys.stderr)
             sys.exit(1)
         except Exception as exc:
+            audit.log_event("revoke_certificate", "failure", f"Revocation failed: {exc}", metadata={"serial": args.serial})
             logger.error(f"Revocation failed: {exc}")
             print(f"Revocation failed: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -679,16 +800,21 @@ def main():
         from .crl import generate_crl
         logger = setup_logger(args.log_file)
         validate_gen_crl_args(args, logger)
+        from .audit import get_audit_logger
+        audit = get_audit_logger(args.out_dir)
+        audit.log_event("generate_crl", "started", "CRL generation started", metadata={"ca": args.ca})
         ca_cert, ca_key, ca_name = _resolve_ca_defaults(args.ca, args.out_dir)
         ca_cert = args.ca_cert or ca_cert
         ca_key = args.ca_key or ca_key
         out_file = args.out_file or os.path.join(args.out_dir, "crl", f"{ca_name}.crl.pem")
         try:
             result = generate_crl(args.db_path, ca_cert, ca_key, load_passphrase(args.ca_pass_file), out_file, args.next_update, logger)
+            audit.log_event("generate_crl", "success", "CRL generated", metadata={"path": result.path, "crl_number": result.crl_number, "revoked_count": result.revoked_count})
             print(f"CRL: {result.path}")
             print(f"CRL number: {result.crl_number}")
             print(f"Revoked certificates: {result.revoked_count}")
         except Exception as exc:
+            audit.log_event("generate_crl", "failure", f"CRL generation failed: {exc}", metadata={"ca": args.ca})
             logger.error(f"CRL generation failed: {exc}")
             print(f"CRL generation failed: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -740,6 +866,7 @@ def main():
                 args.host, args.port, args.db_path, args.cert_dir, logger, args.crl_dir,
                 ca_cert_path=args.ca_cert, ca_key_path=args.ca_key, ca_pass_file=args.ca_pass_file,
                 api_key=args.api_key, default_validity_days=args.default_validity_days,
+                rate_limit=args.rate_limit, rate_burst=args.rate_burst,
             )
         except OSError as exc:
             logger.error(f"Repository server failed: {exc}")
@@ -767,6 +894,8 @@ def main():
                 args.ca_cert,
                 args.cache_ttl,
                 logger,
+                rate_limit=args.rate_limit,
+                rate_burst=args.rate_burst,
             )
         except OSError as exc:
             logger.error(f"OCSP responder failed: {exc}")

@@ -1,5 +1,12 @@
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
+
+def _csr_hash_for_key(private_key):
+    if isinstance(private_key, ec.EllipticCurvePrivateKey) and isinstance(private_key.curve, ec.SECP384R1):
+        return hashes.SHA384()
+    return hashes.SHA256()
 
 
 def generate_intermediate_csr(subject, private_key, pathlen=0):
@@ -8,7 +15,7 @@ def generate_intermediate_csr(subject, private_key, pathlen=0):
     builder = builder.add_extension(
         x509.BasicConstraints(ca=True, path_length=pathlen), critical=True
     )
-    return builder.sign(private_key, hashes.SHA256())
+    return builder.sign(private_key, _csr_hash_for_key(private_key))
 
 
 def serialize_csr_to_pem(csr):
