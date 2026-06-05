@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="660" viewBox="0 0 1120 660" role="img" aria-label="Диаграмма архитектуры MicroPKI">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#333"/></marker>
+    <style>
+      .box{fill:#f7f9fc;stroke:#263238;stroke-width:2;rx:10;ry:10}.title{font:700 18px Arial,sans-serif;fill:#111}.text{font:14px Arial,sans-serif;fill:#222}.small{font:12px Arial,sans-serif;fill:#333}.line{stroke:#333;stroke-width:2;marker-end:url(#arrow);fill:none}.store{fill:#fff8e1;stroke:#5d4037;stroke-width:2;rx:10;ry:10}.sec{fill:#e8f5e9;stroke:#1b5e20;stroke-width:2;rx:10;ry:10}.net{fill:#e3f2fd;stroke:#0d47a1;stroke-width:2;rx:10;ry:10}
+    </style>
+  </defs>
+  <rect x="30" y="35" width="200" height="115" class="box"/><text x="55" y="70" class="title">CLI</text><text x="55" y="100" class="text">ca / client / audit</text><text x="55" y="123" class="small">парсер команд</text>
+  <rect x="320" y="35" width="210" height="115" class="sec"/><text x="350" y="70" class="title">Ядро CA</text><text x="350" y="100" class="text">Root, Intermediate</text><text x="350" y="123" class="small">выпуск, отзыв, CRL</text>
+  <rect x="625" y="35" width="210" height="115" class="sec"/><text x="655" y="70" class="title">Модуль политик</text><text x="655" y="100" class="text">ключи, сроки</text><text x="655" y="123" class="small">SAN, EKU, hash-правила</text>
+  <rect x="900" y="35" width="180" height="115" class="store"/><text x="930" y="70" class="title">SQLite БД</text><text x="930" y="100" class="text">сертификаты</text><text x="930" y="123" class="small">compromised_keys</text>
+
+  <rect x="320" y="240" width="210" height="125" class="net"/><text x="350" y="275" class="title">Репозиторий</text><text x="350" y="305" class="text">/ca/root</text><text x="350" y="327" class="text">/certificate/{serial}</text><text x="350" y="349" class="small">rate limiting</text>
+  <rect x="625" y="240" width="210" height="125" class="net"/><text x="655" y="275" class="title">OCSP responder</text><text x="655" y="305" class="text">POST /ocsp</text><text x="655" y="327" class="small">good / revoked / unknown</text><text x="655" y="349" class="small">rate limiting</text>
+  <rect x="30" y="240" width="200" height="125" class="box"/><text x="55" y="275" class="title">Клиентские утилиты</text><text x="55" y="305" class="text">CSR, проверка</text><text x="55" y="327" class="text">проверка статуса</text><text x="55" y="349" class="small">проверка подписи</text>
+
+  <rect x="320" y="465" width="210" height="120" class="store"/><text x="350" y="500" class="title">PKI-файлы</text><text x="350" y="530" class="text">ключи, certs, CRL</text><text x="350" y="553" class="small">генерируются; не в Git</text>
+  <rect x="625" y="465" width="210" height="120" class="store"/><text x="655" y="500" class="title">Система аудита</text><text x="655" y="530" class="text">audit.log NDJSON</text><text x="655" y="553" class="small">SHA-256 hash chain</text>
+  <rect x="900" y="465" width="180" height="120" class="store"/><text x="930" y="500" class="title">CT-имитация</text><text x="930" y="530" class="text">ct.log</text><text x="930" y="553" class="small">append-only text log</text>
+
+  <path d="M230 92 H320" class="line"/><path d="M530 92 H625" class="line"/><path d="M835 92 H900" class="line"/>
+  <path d="M425 150 V240" class="line"/><path d="M730 150 V240" class="line"/>
+  <path d="M230 300 H320" class="line"/><path d="M530 302 H625" class="line"/><path d="M425 365 V465" class="line"/><path d="M730 365 V465" class="line"/><path d="M835 525 H900" class="line"/>
+  <path d="M530 525 H625" class="line"/><path d="M425 150 C520 210 580 410 625 500" class="line"/>
+  <path d="M425 150 C600 175 820 330 990 465" class="line"/>
+  <text x="48" y="625" class="small">Data flow: CLI drives CA/client/audit operations; CA writes DB, сертификаты, audit entries and CT log; repository and OCSP expose public validation data.</text>
+</svg>

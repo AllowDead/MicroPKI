@@ -1,971 +1,237 @@
-# MicroPKI
+# MicroPKI v1.0.0
 
-MicroPKI — учебная CLI-утилита для создания Root CA, Intermediate CA и выпуска конечных X.509-сертификатов по шаблонам `server`, `client`, `code_signing`.
+MicroPKI is an educational command-line Public Key Infrastructure that creates a Root CA and Intermediate CA, issues X.509 certificates, serves repository and OCSP endpoints, validates chains and revocation status, signs files, and records security-sensitive actions in a tamper-evident audit log.
 
-## Требования
+![MicroPKI architecture](docs/architecture.svg)
 
-- Python 3.8+
-- `cryptography>=41.0.0`
-- `pytest>=7.0.0` для тестов
-- OpenSSL CLI — только для дополнительных interoperability/TLS-проверок. Если OpenSSL не установлен, соответствующий pytest-тест пропускается.
+## Features
 
-## Установка
+- Root CA and Intermediate CA creation with encrypted CA private keys.
+- End-entity certificate issuance for `server`, `client`, and `code_signing` templates.
+- External CSR processing and client CSR generation.
+- Certificate database with certificate status, revocation metadata, CRL numbering, and compromised-key tracking.
+- CRL generation and OCSP responder support.
+- Repository HTTP service for CA certificates, issued certificates, CRLs, and CSR submission.
+- Client-side path validation, purpose/EKU validation, CRL and OCSP status checks.
+- Sprint 7 hardening: audit NDJSON, SHA-256 hash chain, CT simulation, policy enforcement, compromise simulation, and rate limiting.
+- Sprint 8 deliverables: automated end-to-end demo, TLS demonstration, code-signing demonstration, final documentation, test suite, performance test hook, and CI workflow.
+
+## Prerequisites
+
+- Python 3.8 or newer.
+- `cryptography>=41.0.0`.
+- `pytest`, `pytest-cov` for tests and coverage.
+- OpenSSL CLI is optional. The built-in Sprint 8 demo uses Python TLS and does not require manual OpenSSL commands.
+
+## Installation
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate      # Linux/macOS
 # .venv\Scripts\activate       # Windows PowerShell/CMD
-
 python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-После установки команда `micropki` доступна из активированного окружения. Без установки можно использовать `python -m micropki`.
+After installation, use `micropki`. Without installation, run commands as `python -m micropki` from the repository root.
 
-## Sprint 1: создание Root CA
+## Configuration
 
-```bash
-mkdir -p secrets logs
-printf "root-passphrase\n" > secrets/root.pass
+`micropki` accepts an optional `--config` flag. The default sample is `micropki.toml`; the Sprint 8 demo sample is `demo/micropki.demo.toml`. Configuration can describe audit paths, policy settings, CT log paths, and rate-limit defaults. CLI arguments remain explicit and override normal command defaults.
 
-micropki ca init \
-  --subject "/CN=Demo Root CA,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 4096 \
-  --passphrase-file ./secrets/root.pass \
-  --out-dir ./pki \
-  --validity-days 3650 \
-  --log-file ./logs/ca-init.log
-```
+Generated certificates, keys, databases, CRLs and logs are intentionally ignored by Git. They are created under `pki/` or `demo/_work/` during local runs.
 
-ECC-вариант Root CA:
+## CLI reference
+
+General form:
 
 ```bash
-micropki ca init \
-  --subject "CN=ECC Root CA,O=MicroPKI" \
-  --key-type ecc \
-  --key-size 384 \
-  --passphrase-file ./secrets/root.pass \
-  --out-dir ./pki-ecc
+micropki [--config micropki.toml] <group> <command> [options]
 ```
 
-Если выходные файлы уже существуют, `ca init` запросит подтверждение перезаписи. Для перезаписи без вопроса используйте `--force`.
-
-## Sprint 2: выпуск Intermediate CA
+CA commands:
 
 ```bash
-printf "intermediate-passphrase\n" > secrets/intermediate.pass
-
-micropki ca issue-intermediate \
-  --root-cert ./pki/certs/ca.cert.pem \
-  --root-key ./pki/private/ca.key.pem \
-  --root-pass-file ./secrets/root.pass \
-  --subject "CN=MicroPKI Intermediate CA,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 4096 \
-  --passphrase-file ./secrets/intermediate.pass \
-  --out-dir ./pki \
-  --validity-days 1825 \
-  --pathlen 0
+micropki ca init --subject "CN=Demo Root CA,O=MicroPKI" --key-type ecc --key-size 384 --passphrase-file secrets/root.pass --out-dir pki --db-path pki/micropki.db --force
+micropki ca verify --cert pki/certs/ca.cert.pem
+micropki ca issue-intermediate --root-cert pki/certs/ca.cert.pem --root-key pki/private/ca.key.pem --root-pass-file secrets/root.pass --subject "CN=Demo Intermediate CA,O=MicroPKI" --key-type ecc --key-size 384 --passphrase-file secrets/intermediate.pass --out-dir pki --db-path pki/micropki.db
+micropki ca issue-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --template server --subject "CN=localhost,O=MicroPKI" --san dns:localhost --san ip:127.0.0.1 --out-dir pki/certs --db-path pki/micropki.db
+micropki ca issue-ocsp-cert --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --subject "CN=OCSP Responder,O=MicroPKI" --san dns:ocsp.local --out-dir pki/certs --db-path pki/micropki.db
+micropki ca verify-chain --root-cert pki/certs/ca.cert.pem --intermediate-cert pki/certs/intermediate.cert.pem --cert pki/certs/localhost.cert.pem --purpose server
+micropki ca list-certs --db-path pki/micropki.db --format table
+micropki ca show-cert <SERIAL_HEX> --db-path pki/micropki.db
+micropki ca revoke <SERIAL_HEX> --reason keyCompromise --force --crl pki/crl/intermediate.crl.pem --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --ca-pass-file secrets/intermediate.pass --db-path pki/micropki.db
+micropki ca gen-crl --ca intermediate --out-dir pki --ca-pass-file secrets/intermediate.pass --ca-cert pki/certs/intermediate.cert.pem --ca-key pki/private/intermediate.key.pem --db-path pki/micropki.db
+micropki ca check-revoked <SERIAL_HEX> --db-path pki/micropki.db
+micropki ca compromise --cert pki/certs/localhost.cert.pem --reason keyCompromise --force --db-path pki/micropki.db --out-dir pki
 ```
 
-Команда создаёт:
-
-```text
-pki/private/intermediate.key.pem
-pki/certs/intermediate.cert.pem
-pki/csrs/intermediate.csr.pem
-```
-
-Ключ Intermediate CA хранится зашифрованным PKCS#8 PEM. В `policy.txt` добавляется секция Intermediate CA с subject, serial, validity, key algorithm/size, path length и issuer.
-
-## Sprint 2: выпуск server certificate
+Client commands:
 
 ```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --subject "CN=example.com,O=MicroPKI" \
-  --san dns:example.com \
-  --san dns:www.example.com \
-  --san ip:192.168.1.10 \
-  --out-dir ./pki/certs \
-  --validity-days 365
+micropki client gen-csr --subject "CN=app.example.com,O=MicroPKI" --key-type rsa --key-size 2048 --san dns:app.example.com --out-key app.key.pem --out-csr app.csr.pem
+micropki client request-cert --csr app.csr.pem --template server --ca-url http://127.0.0.1:8080 --out-cert app.cert.pem
+micropki client validate --cert pki/certs/localhost.cert.pem --untrusted pki/certs/intermediate.cert.pem --trusted pki/certs/ca.cert.pem --purpose server --crl pki/crl/intermediate.crl.pem --ca-cert pki/certs/intermediate.cert.pem
+micropki client check-status --cert pki/certs/localhost.cert.pem --ca-cert pki/certs/intermediate.cert.pem --ocsp-url http://127.0.0.1:8081/ocsp
+micropki client sign --input demo/sample_app.py --key pki/certs/Demo_Code_Signer.key.pem --signature demo/sample_app.py.sig
+micropki client verify-signature --input demo/sample_app.py --signature demo/sample_app.py.sig --cert pki/certs/Demo_Code_Signer.cert.pem --trusted pki/certs/ca.cert.pem --untrusted pki/certs/intermediate.cert.pem
 ```
 
-Для `server` обязателен хотя бы один `dns:` или `ip:` SAN. Конечный приватный ключ сохраняется рядом с сертификатом в открытом PEM-виде с правами `0o600`; утилита пишет предупреждение в лог.
-
-## Sprint 2: выпуск client certificate
+Server commands:
 
 ```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template client \
-  --subject "CN=Alice Smith,EMAIL=alice@example.com" \
-  --san email:alice@example.com \
-  --out-dir ./pki/certs
-```
-
-Для `client` допустимы `email:` и `dns:` SAN.
-
-## Sprint 2: выпуск code signing certificate
-
-```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template code_signing \
-  --subject "CN=MicroPKI Code Signer" \
-  --out-dir ./pki/certs
-```
-
-Для `code_signing` SAN не обязателен. Если SAN указан, допускаются только `dns:` и `uri:`.
-
-## Sprint 2: подпись внешнего CSR
-
-Опционально `issue-cert` принимает `--csr`. CSR проверяется по подписи. Если CSR запрашивает `CA=TRUE`, выпуск конечного сертификата отклоняется.
-
-```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --subject "CN=csr.example.com" \
-  --san dns:csr.example.com \
-  --csr ./external/server.csr.pem \
-  --out-dir ./pki/certs
-```
-
-## Проверка Root CA
-
-```bash
-micropki ca verify --cert ./pki/certs/ca.cert.pem
-```
-
-Ожидаемый результат:
-
-```text
-/path/to/pki/certs/ca.cert.pem: OK
-```
-
-## Проверка цепочки leaf → intermediate → root
-
-```bash
-micropki ca verify-chain \
-  --root-cert ./pki/certs/ca.cert.pem \
-  --intermediate-cert ./pki/certs/intermediate.cert.pem \
-  --cert ./pki/certs/example.com.cert.pem \
-  --purpose server
-```
-
-Команда проверяет подписи, сроки действия, Basic Constraints и базовое соответствие Key Usage / Extended Key Usage.
-
-## Дополнительная проверка через OpenSSL
-
-Инспекция расширений:
-
-```bash
-openssl x509 -in ./pki/certs/intermediate.cert.pem -text -noout
-openssl x509 -in ./pki/certs/example.com.cert.pem -text -noout
-```
-
-Проверка цепочки через OpenSSL:
-
-```bash
-openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/intermediate.cert.pem
-openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermediate.cert.pem ./pki/certs/example.com.cert.pem
-```
-
-Также есть скрипт:
-
-```bash
-python scripts/openssl_verify_chain.py \
-  --root-cert ./pki/certs/ca.cert.pem \
-  --intermediate-cert ./pki/certs/intermediate.cert.pem \
-  --cert ./pki/certs/example.com.cert.pem
-```
-
-Примечание: в Sprint 1 AKI у Root CA намеренно помечен critical по требованию проверки. Некоторые версии OpenSSL могут отклонять такой Root CA как `unhandled critical extension`; поэтому основная проверка реализована встроенной командой `micropki ca verify-chain`.
-
-## TLS round-trip test
-
-Для демонстрации server certificate в TLS можно использовать OpenSSL-скрипт:
-
-```bash
-python scripts/tls_roundtrip.py \
-  --root-cert ./pki/certs/ca.cert.pem \
-  --chain-cert ./pki/certs/intermediate.cert.pem \
-  --server-cert ./pki/certs/example.com.cert.pem \
-  --server-key ./pki/certs/example.com.key.pem
-```
-
-Скрипт запускает `openssl s_server` и подключается к нему через `openssl s_client`, доверяя Root CA.
-
-## Тестирование
-
-```bash
-make test
-```
-
-На Windows `make` может отсутствовать в Git Bash. В этом случае используйте:
-
-```bash
-python run_tests.py
-```
-
-или напрямую:
-
-```bash
-python -m pytest -q
-```
-
-Для CMD также доступен:
-
-```bat
-run_tests.bat
-```
-
-## Структура проекта
-
-```text
-micropki/
-  __init__.py
-  __main__.py
-  ca.py
-  certificates.py
-  chain.py
-  cli.py
-  crypto_utils.py
-  csr.py
-  logger.py
-  templates.py
-  database.py
-  repository.py
-  serial.py
-  crl.py
-  revocation.py
-scripts/
-  openssl_verify_chain.py
-  tls_roundtrip.py
-tests/
-  test_micropki.py
-  test_openssl_compat.py
-  test_sprint2.py
-pyproject.toml
-requirements.txt
-Makefile
-run_tests.py
-run_tests.bat
-run_tests.sh
-README.md
-COMPLIANCE_REPORT.md
-```
-
-## Sprint 3: база сертификатов SQLite
-
-Инициализация базы сертификатов:
-
-```bash
-micropki db init --db-path ./pki/micropki.db
-```
-
-Команда идемпотентна: повторный запуск не ломает существующую схему. База содержит таблицу `certificates`, уникальный индекс по `serial_hex`, индекс по `status` и служебную таблицу `schema_migrations` для простой подготовки к будущим миграциям.
-
-Начиная со Sprint 3, команды `ca init`, `ca issue-intermediate` и `ca issue-cert` поддерживают `--db-path`. По умолчанию используется `./pki/micropki.db`. Новые сертификаты автоматически заносятся в базу после выпуска.
-
-Пример полного начала работы:
-
-```bash
-mkdir -p secrets
-printf "root-passphrase\n" > secrets/root.pass
-printf "intermediate-passphrase\n" > secrets/intermediate.pass
-
-micropki db init --db-path ./pki/micropki.db
-
-micropki ca init \
-  --subject "CN=Demo Root CA,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 4096 \
-  --passphrase-file ./secrets/root.pass \
-  --out-dir ./pki \
-  --db-path ./pki/micropki.db \
-  --force
-
-micropki ca issue-intermediate \
-  --root-cert ./pki/certs/ca.cert.pem \
-  --root-key ./pki/private/ca.key.pem \
-  --root-pass-file ./secrets/root.pass \
-  --subject "CN=MicroPKI Intermediate CA,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 4096 \
-  --passphrase-file ./secrets/intermediate.pass \
-  --out-dir ./pki \
-  --db-path ./pki/micropki.db
-
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --subject "CN=example.com,O=MicroPKI" \
-  --san dns:example.com \
-  --san ip:127.0.0.1 \
-  --out-dir ./pki/certs \
-  --db-path ./pki/micropki.db
-```
-
-## Sprint 3: просмотр сертификатов из базы
-
-Список сертификатов:
-
-```bash
-micropki ca list-certs --db-path ./pki/micropki.db --format table
-micropki ca list-certs --db-path ./pki/micropki.db --status valid --format json
-micropki ca list-certs --db-path ./pki/micropki.db --format csv
-```
-
-Вывод PEM по серийному номеру:
-
-```bash
-micropki ca show-cert 2A7F --db-path ./pki/micropki.db > cert.pem
-```
-
-## Sprint 3: HTTP repository server
-
-Запуск сервера репозитория:
-
-```bash
-micropki repo serve \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --db-path ./pki/micropki.db \
-  --cert-dir ./pki/certs \
-  --log-file ./logs/repo.log
-```
-
-Проверка порта сервера:
-
-```bash
+micropki repo serve --host 127.0.0.1 --port 8080 --db-path pki/micropki.db --cert-dir pki/certs --crl-dir pki/crl --rate-limit 5 --rate-burst 10
 micropki repo status --host 127.0.0.1 --port 8080
+micropki ocsp serve --host 127.0.0.1 --port 8081 --db-path pki/micropki.db --responder-cert pki/certs/ocsp.cert.pem --responder-key pki/certs/ocsp.key.pem --ca-cert pki/certs/intermediate.cert.pem --rate-limit 5 --rate-burst 10
 ```
 
-Примеры API-запросов:
+Audit commands:
 
 ```bash
-curl http://127.0.0.1:8080/certificate/2A7F --output cert.pem
-curl http://127.0.0.1:8080/ca/root --output root.pem
-curl http://127.0.0.1:8080/ca/intermediate --output intermediate.pem
-curl -i http://127.0.0.1:8080/crl
+micropki audit query --operation issue --format table --verify --log-file pki/audit/audit.log --chain-file pki/audit/chain.dat
+micropki audit verify --log-file pki/audit/audit.log --chain-file pki/audit/chain.dat
+micropki audit ct-verify --cert pki/certs/localhost.cert.pem --ct-log pki/audit/ct.log
 ```
 
-Эндпоинты:
+Every command also supports `--help`; the parser lists required arguments and defaults.
 
-```text
-GET /certificate/<serial>   # PEM сертификата из SQLite, 400 для не-hex serial, 404 если не найден
-GET /ca/root                # pki/certs/ca.cert.pem
-GET /ca/intermediate        # pki/certs/intermediate.cert.pem
-GET /crl                    # текущий Intermediate CRL, 404 если CRL ещё не создан
-GET /crl?ca=root            # Root CRL
-GET /crl/intermediate.crl   # альтернативный путь к CRL
-```
+## Repository API reference
 
-Все ответы HTTP включают `Access-Control-Allow-Origin: *`. Каждый запрос логируется в формате с префиксом `[HTTP]`, методом, путём, IP клиента и статусом ответа.
+The repository server is intentionally small and uses plain HTTP.
 
-## Sprint 3: дополнительные проверки
+- `GET /ca/root` returns the Root CA certificate PEM.
+- `GET /ca/intermediate` returns the Intermediate CA certificate PEM.
+- `GET /certificate/{serial}` returns an issued certificate PEM by serial number.
+- `GET /crl?ca=intermediate` or `GET /crl/intermediate.crl` returns a CRL if generated.
+- `POST /request-cert?template=server|client|code_signing` accepts a PEM CSR and returns the issued certificate PEM. If `--api-key` is configured, the request must include `X-API-Key`.
 
-Проверка генератора serial:
+The OCSP responder accepts `POST /` or `POST /ocsp` with `Content-Type: application/ocsp-request` and returns a DER OCSP response.
+
+## Demo walkthrough
+
+Run the complete automated demo:
 
 ```bash
-python scripts/serial_stress.py --db-path ./pki/micropki.db --count 100
+make demo
+# or
+python demo/demo.py
 ```
 
-Полный интеграционный workflow Sprint 3:
+The script is idempotent. It removes `demo/_work` before starting unless `--keep` is supplied. It performs these steps:
+
+1. Creates passphrase files and the PKI directory structure.
+2. Initializes the Root CA and Intermediate CA.
+3. Issues server, client, code-signing, and OCSP responder certificates.
+4. Starts repository and OCSP servers in the background.
+5. Validates the server certificate chain and OCSP status.
+6. Starts a real Python TLS server with the MicroPKI-issued server certificate.
+7. Proves TLS fails without the Root CA trust anchor and succeeds when the Root CA is supplied.
+8. Signs a file with the code-signing certificate and verifies the detached signature.
+9. Modifies the file and proves verification fails.
+10. Attempts an invalid wildcard server certificate and proves policy enforcement blocks it.
+11. Revokes the server certificate, regenerates the CRL, and proves validation fails with revocation checking.
+12. Verifies the audit hash chain and CT simulation log.
+13. Stops background services.
+
+Expected output uses `[PASS]` after successful positive and expected-negative steps.
+
+## TLS demonstration commands
+
+The demo creates `localhost.cert.pem`, `localhost.key.pem`, and a certificate chain file containing the server certificate plus Intermediate CA. A trust-aware client must supply `pki/certs/ca.cert.pem` as the trust anchor. Without that Root CA, the TLS handshake is expected to fail.
+
+The same result can be reproduced manually with Python or OpenSSL. The important requirement is that the server presents the issued leaf certificate and Intermediate CA, while the client trusts only the MicroPKI Root CA.
+
+After revocation, the TLS transport itself may still complete if the client does not check revocation. `micropki client validate --crl ...` demonstrates the required revocation-aware failure.
+
+## Code-signing demonstration
+
+Code signing uses `micropki client sign` and `micropki client verify-signature`. The signature is detached and binary. Verification checks both the file signature and the certificate chain with the `code_signing` EKU. If a CRL and issuer certificate are provided, the signer certificate must also be non-revoked.
 
 ```bash
-python scripts/integration_sprint3.py
+micropki client sign --input sample_app.py --key pki/certs/Demo_Code_Signer.key.pem --signature sample_app.py.sig
+micropki client verify-signature --input sample_app.py --signature sample_app.py.sig --cert pki/certs/Demo_Code_Signer.cert.pem --trusted pki/certs/ca.cert.pem --untrusted pki/certs/intermediate.cert.pem
 ```
 
-Тесты:
+Editing the signed file after signing causes verification to fail.
+
+## Audit system and CT simulation
+
+Audit entries are newline-delimited JSON objects in `pki/audit/audit.log`. Each entry contains timestamp, level, operation, status, message, metadata, and integrity data. Integrity is a SHA-256 hash chain: each entry stores the previous hash and its own canonical JSON hash. `chain.dat` stores the latest chain state.
+
+Use:
 
 ```bash
-python run_tests.py
+micropki audit verify --log-file pki/audit/audit.log --chain-file pki/audit/chain.dat
+micropki audit query --operation issue --format json --verify
 ```
 
-На текущей версии тестовый набор покрывает SQLite-схему, уникальность serial, автоматическую вставку сертификатов, CLI `list-certs`/`show-cert`, HTTP API `/certificate/<serial>`, `/ca/root`, `/ca/intermediate`, `/crl`, CORS и негативную проверку невалидного serial.
+The CT simulation log is `pki/audit/ct.log`. It is append-only plain text containing timestamp, serial, subject, certificate fingerprint, and issuer. It is a simulation only; it is not a real Merkle-tree CT log.
 
+## Policy enforcement
 
-## Sprint 4: отзыв сертификатов и CRL
-
-Sprint 4 добавляет полный цикл отзыва сертификатов: запись статуса в SQLite, генерацию X.509 CRL v2, хранение CRL в `pki/crl/` и HTTP-раздачу CRL через репозиторий.
-
-Структура `pki/` теперь включает каталог CRL:
-
-```text
-pki/
-  private/
-  certs/
-  csrs/
-  crl/
-    root.crl.pem
-    intermediate.crl.pem
-  micropki.db
-  policy.txt
-```
-
-Поддерживаемые причины отзыва:
-
-```text
-unspecified, keyCompromise, cACompromise, affiliationChanged,
-superseded, cessationOfOperation, certificateHold, removeFromCRL,
-privilegeWithdrawn, aACompromise
-```
-
-Отзыв сертификата по serial:
-
-```bash
-micropki ca revoke 2A7F \
-  --reason keyCompromise \
-  --db-path ./pki/micropki.db \
-  --force
-```
-
-Без `--force` команда запросит интерактивное подтверждение. Если сертификат уже отозван, команда пишет предупреждение и завершается успешно без изменения записи. Если serial не найден, команда возвращает ненулевой код.
-
-Генерация Intermediate CRL:
-
-```bash
-micropki ca gen-crl \
-  --ca intermediate \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --out-dir ./pki \
-  --db-path ./pki/micropki.db \
-  --next-update 7
-```
-
-Генерация Root CRL:
-
-```bash
-micropki ca gen-crl \
-  --ca root \
-  --ca-pass-file ./secrets/root.pass \
-  --out-dir ./pki \
-  --db-path ./pki/micropki.db
-```
-
-Можно явно указать пути к CA certificate/key и выходному CRL-файлу:
-
-```bash
-micropki ca gen-crl \
-  --ca intermediate \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --out-file ./backup/intermediate.crl.pem \
-  --db-path ./pki/micropki.db
-```
-
-Быстрая проверка статуса в базе:
-
-```bash
-micropki ca check-revoked 2A7F --db-path ./pki/micropki.db
-```
-
-## Sprint 4: CRL через HTTP repository
-
-Запуск сервера с каталогом CRL:
-
-```bash
-micropki repo serve \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --db-path ./pki/micropki.db \
-  --cert-dir ./pki/certs \
-  --crl-dir ./pki/crl
-```
-
-Получение CRL:
-
-```bash
-curl -H "Accept: application/pkix-crl" http://127.0.0.1:8080/crl --output intermediate.crl.pem
-curl http://127.0.0.1:8080/crl?ca=root --output root.crl.pem
-curl http://127.0.0.1:8080/crl/intermediate.crl --output intermediate.crl.pem
-```
-
-Ответ CRL возвращается с `Content-Type: application/pkix-crl`, `Access-Control-Allow-Origin: *`, `Last-Modified`, `Cache-Control` и `ETag`. Если CRL-файл ещё не создан, сервер возвращает `404 Not Found`.
-
-## Sprint 4: проверка CRL
-
-Инспекция CRL:
-
-```bash
-openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -text -noout
-```
-
-Проверка подписи CRL Intermediate CA:
-
-```bash
-openssl crl \
-  -in ./pki/crl/intermediate.crl.pem \
-  -inform PEM \
-  -CAfile ./pki/certs/intermediate.cert.pem \
-  -noout
-```
-
-Ожидаемый результат OpenSSL: `verify OK`.
-
-Полный жизненный цикл в тестах покрывает выпуск leaf-сертификата, отзыв с причиной `keyCompromise`, обновление полей `status`, `revocation_reason`, `revocation_date`, генерацию CRL, наличие serial в CRL, увеличение CRL Number, HTTP-раздачу CRL и негативные сценарии для отсутствующего/уже отозванного сертификата.
-
-## Sprint 5: выпуск OCSP responder certificate
-
-OCSP responder certificate — специальный конечный сертификат для подписи OCSP-ответов. Он выпускается от Intermediate CA, содержит `BasicConstraints: CA=FALSE`, `KeyUsage: digitalSignature` и `ExtendedKeyUsage: OCSPSigning`.
-
-```bash
-micropki ca issue-ocsp-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --subject "CN=OCSP Responder,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 2048 \
-  --san dns:ocsp.example.com \
-  --out-dir ./pki/certs \
-  --validity-days 365
-```
-
-Команда создаёт:
-
-```text
-pki/certs/ocsp.cert.pem
-pki/certs/ocsp.key.pem
-pki/ocsp/
-```
-
-Приватный ключ OCSP responder хранится незашифрованным PEM с правами `0o600`, потому что responder должен загружать его автоматически при старте. Утилита выводит предупреждение об этом в лог.
-
-## Sprint 5: запуск OCSP responder
-
-```bash
-micropki ocsp serve \
-  --host 127.0.0.1 \
-  --port 8081 \
-  --db-path ./pki/micropki.db \
-  --responder-cert ./pki/certs/ocsp.cert.pem \
-  --responder-key ./pki/certs/ocsp.key.pem \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --cache-ttl 120 \
-  --log-file ./logs/ocsp.log
-```
-
-Responder принимает DER-кодированные OCSP-запросы через HTTP POST на `/ocsp` или `/` с заголовком:
-
-```text
-Content-Type: application/ocsp-request
-```
-
-Ответ возвращается с:
-
-```text
-Content-Type: application/ocsp-response
-```
-
-Responder определяет статус по SQLite-базе:
-
-```text
-valid   -> good
-revoked -> revoked
-missing / wrong issuer -> unknown
-```
-
-Каждый OCSP-запрос логируется в структурированном JSON-подобном формате: client IP, serial, статус ответа, совпадение issuer и время обработки в миллисекундах.
-
-## Sprint 5: проверка через OpenSSL ocsp
-
-Good status:
-
-```bash
-openssl ocsp \
-  -issuer ./pki/certs/intermediate.cert.pem \
-  -cert ./pki/certs/example.com.cert.pem \
-  -url http://127.0.0.1:8081/ocsp \
-  -VAfile ./pki/certs/ocsp.cert.pem \
-  -CAfile ./pki/certs/intermediate.cert.pem \
-  -partial_chain \
-  -no_nonce
-```
-
-Ожидаемый результат:
-
-```text
-Response verify OK
-./pki/certs/example.com.cert.pem: good
-```
-
-Revoked status:
-
-```bash
-micropki ca revoke <SERIAL> --reason keyCompromise --force --db-path ./pki/micropki.db
-
-openssl ocsp \
-  -issuer ./pki/certs/intermediate.cert.pem \
-  -cert ./pki/certs/example.com.cert.pem \
-  -url http://127.0.0.1:8081/ocsp \
-  -VAfile ./pki/certs/ocsp.cert.pem \
-  -CAfile ./pki/certs/intermediate.cert.pem \
-  -partial_chain \
-  -no_nonce
-```
-
-## Sprint 5: OCSP nonce и replay protection
-
-OCSP nonce — расширение запроса с OID `1.3.6.1.5.5.7.48.1.2`. Клиент добавляет случайное значение в запрос, а responder обязан вернуть точно такое же значение в ответе. Это помогает обнаруживать повторно отправленные старые OCSP-ответы.
-
-В MicroPKI responder работает так:
-
-```text
-request has nonce    -> response echoes the same nonce
-request has no nonce -> response has no nonce extension
-```
-
-OpenSSL-запрос с nonce:
-
-```bash
-openssl ocsp \
-  -issuer ./pki/certs/intermediate.cert.pem \
-  -cert ./pki/certs/example.com.cert.pem \
-  -url http://127.0.0.1:8081/ocsp \
-  -VAfile ./pki/certs/ocsp.cert.pem \
-  -CAfile ./pki/certs/intermediate.cert.pem \
-  -partial_chain \
-  -nonce
-```
-
-## Sprint 5: структура проекта
-
-```text
-micropki/
-  ocsp.py
-  ocsp_responder.py
-```
-
-`ocsp.py` содержит разбор OCSP request, построение signed OCSP response, nonce handling, status determination и проверку OCSP signer certificate.  
-`ocsp_responder.py` содержит HTTP-server для `micropki ocsp serve`.
-
-## Sprint 6: client CSR generation
-
-Generate an end-entity private key and PKCS#10 CSR:
-
-```bash
-micropki client gen-csr \
-  --subject "CN=app.example.com,O=MicroPKI" \
-  --key-type rsa \
-  --key-size 2048 \
-  --san dns:app.example.com \
-  --san dns:api.example.com \
-  --out-key ./app.key.pem \
-  --out-csr ./app.csr.pem
-```
-
-The generated private key is unencrypted PEM and is written with `0o600` permissions where the operating system supports POSIX file modes. The command logs a warning because this key is not passphrase-protected.
-
-## Sprint 6: CSR-based certificate issuance
-
-`ca issue-cert` now accepts an external CSR:
-
-```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --csr ./app.csr.pem \
-  --out-dir ./pki/certs \
-  --db-path ./pki/micropki.db
-```
-
-When `--csr` is used, the certificate subject and SANs are taken from the CSR. The CSR signature is verified. A CSR that requests `CA=TRUE` is rejected for end-entity issuance.
-
-## Sprint 6: repository certificate request endpoint
-
-The repository server can issue certificates through `POST /request-cert` when CA credentials are supplied at startup:
-
-```bash
-micropki repo serve \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --db-path ./pki/micropki.db \
-  --cert-dir ./pki/certs \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --api-key changeme
-```
-
-The demo API key is intentionally simple and is not production authentication. For a coursework/demo system it proves the flow; a real CA would require strong authentication, authorisation, approval workflow, rate limiting and audit controls.
-
-Manual request example:
-
-```bash
-cat ./app.csr.pem | curl -X POST \
-  -H "Content-Type: application/x-pem-file" \
-  -H "X-API-Key: changeme" \
-  --data-binary @- \
-  "http://localhost:8080/request-cert?template=server" \
-  --output ./app.cert.pem
-```
-
-Client wrapper:
-
-```bash
-micropki client request-cert \
-  --csr ./app.csr.pem \
-  --template server \
-  --ca-url http://localhost:8080 \
-  --api-key changeme \
-  --out-cert ./app.cert.pem
-```
-
-## Sprint 6: certificate chain validation
-
-Validate a leaf certificate against an intermediate and trusted root:
-
-```bash
-micropki client validate \
-  --cert ./app.cert.pem \
-  --untrusted ./pki/certs/intermediate.cert.pem \
-  --trusted ./pki/certs/ca.cert.pem \
-  --purpose server \
-  --mode chain
-```
-
-Full validation with revocation checking:
-
-```bash
-micropki client validate \
-  --cert ./app.cert.pem \
-  --untrusted ./pki/certs/intermediate.cert.pem \
-  --trusted ./pki/certs/ca.cert.pem \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ocsp \
-  --ocsp-url http://127.0.0.1:8081/ocsp \
-  --crl http://127.0.0.1:8080/crl?ca=intermediate \
-  --purpose server \
-  --mode full
-```
-
-The validator builds the shortest chain from leaf to trusted root, then checks signatures, validity periods, Basic Constraints, path length constraints, CA Key Usage and optional EKU purpose.
-
-`--validation-time` can be used to test expired or not-yet-valid certificates:
-
-```bash
-micropki client validate \
-  --cert ./app.cert.pem \
-  --untrusted ./pki/certs/intermediate.cert.pem \
-  --trusted ./pki/certs/ca.cert.pem \
-  --validation-time 2035-01-01T00:00:00Z
-```
-
-## Sprint 6: revocation status checking
-
-Standalone revocation status check:
-
-```bash
-micropki client check-status \
-  --cert ./app.cert.pem \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ocsp-url http://127.0.0.1:8081/ocsp \
-  --crl ./pki/crl/intermediate.crl.pem
-```
-
-Preference logic:
-
-```text
-1. Try OCSP first if --ocsp-url is supplied or an OCSP AIA URI exists in the certificate.
-2. If OCSP returns good or revoked with a valid response, use that status.
-3. If OCSP is unreachable, malformed, invalid, or unknown, fall back to CRL.
-4. If CRL is valid and contains the certificate serial, status is revoked.
-5. If CRL is valid and does not contain the serial, status is good.
-6. If neither OCSP nor CRL can provide a definitive answer, status is unknown.
-```
-
-The client can parse OCSP responder URIs from Authority Information Access and CRL URLs from CRL Distribution Points when those extensions are present. Manual `--ocsp-url` and `--crl` flags override discovery.
-
-## Sprint 6: structure
-
-```text
-micropki/
-  validation.py
-  revocation_check.py
-  client.py
-```
-
-`validation.py` contains custom simplified RFC 5280 path building and validation. `revocation_check.py` contains CRL and OCSP client checks with fallback. `client.py` contains CSR generation, certificate request, validation and status-check helper functions.
-
-
-## Sprint 7: security hardening, audit and policy enforcement
-
-Sprint 7 hardens MicroPKI with structured audit logging, hash-chain integrity checks, certificate policy enforcement, compromise simulation, Certificate Transparency simulation and optional HTTP rate limiting.
-
-### Audit log
-
-Security-sensitive operations write NDJSON audit entries to `./pki/audit/audit.log`. Each line is one JSON object with `timestamp`, `level`, `operation`, `status`, `message`, `metadata` and `integrity`. The `integrity` object contains `prev_hash` and `hash`. `chain.dat` stores the hash chain so the log can be checked for modified, deleted or reordered entries.
-
-Verify the full audit log:
-
-```bash
-micropki audit verify \
-  --log-file ./pki/audit/audit.log \
-  --chain-file ./pki/audit/chain.dat
-```
-
-Query audit entries:
-
-```bash
-micropki audit query \
-  --operation issue \
-  --level AUDIT \
-  --format table \
-  --verify
-```
-
-Supported filters are `--from`, `--to`, `--level`, `--operation`, `--serial`, `--format table|json|csv` and `--verify`. If `--verify` detects tampering, the command exits with a non-zero status.
-
-### Certificate policy enforcement
-
-The CA now blocks policy violations before issuing a certificate. Blocked operations are audited with `operation=policy_violation`.
-
-Mandatory defaults:
-
-- Root CA: RSA at least 4096 bits or ECC P-384; maximum validity 3650 days.
-- Intermediate CA: RSA at least 3072 bits or ECC P-384; maximum validity 1825 days; `pathLen=0`.
-- End-entity certificates: RSA at least 2048 bits or ECC P-256; maximum validity 365 days.
-- Server SANs: only `dns` and `ip`; wildcard DNS such as `dns:*.example.com` is rejected by default.
-- Client SANs: `email` and `dns` are allowed.
-- Code-signing SANs: only `dns` and `uri`; `email` and `ip` are rejected.
-- CSR signatures must use SHA-256 or stronger; SHA-1 is rejected.
+The CA blocks policy violations before issuance and records them in the audit log. Enforced rules include key sizes, validity windows, SAN restrictions by template, wildcard rejection by default, CSR signature checks, hash/signature algorithm checks, and Intermediate CA path length restrictions.
 
 Examples of blocked requests:
 
 ```bash
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --subject "CN=wild.example.com,O=MicroPKI" \
-  --san dns:*.example.com \
-  --out-dir ./pki/certs
-
-micropki ca issue-cert \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass \
-  --template server \
-  --subject "CN=long.example.com,O=MicroPKI" \
-  --san dns:long.example.com \
-  --validity-days 366
+micropki ca issue-cert ... --template server --san dns:*.example.com
+micropki ca issue-cert ... --template server --validity-days 366
 ```
 
-### Certificate Transparency simulation
+## Testing and coverage
 
-Every issued certificate is appended to `./pki/audit/ct.log`. Each line contains timestamp, certificate serial, subject DN, SHA-256 fingerprint and issuer DN. This is a simple append-only simulation, not a Merkle-tree CT implementation.
-
-Check certificate inclusion:
+Run normal tests:
 
 ```bash
-micropki audit ct-verify \
-  --cert ./pki/certs/example.com.cert.pem \
-  --ct-log ./pki/audit/ct.log
+make test
+# equivalent:
+python -m pytest -q -k "not perf"
 ```
 
-### Private key compromise simulation
-
-Use `ca compromise` to simulate a compromised private key. The command revokes the certificate with reason `keyCompromise`, writes a high-severity audit event and stores the public-key hash in the `compromised_keys` table. Future CSRs using the same public key are blocked.
+Run coverage:
 
 ```bash
-micropki ca compromise \
-  --cert ./pki/certs/example.com.cert.pem \
-  --reason keyCompromise \
-  --force
+make coverage
 ```
 
-Optional emergency CRL generation:
+Run the 1000-certificate performance test explicitly:
 
 ```bash
-micropki ca compromise \
-  --cert ./pki/certs/example.com.cert.pem \
-  --reason keyCompromise \
-  --force \
-  --crl ./pki/crl/intermediate.crl.pem \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --ca-key ./pki/private/intermediate.key.pem \
-  --ca-pass-file ./secrets/intermediate.pass
+make perf-test
+# equivalent:
+MICROPKI_RUN_PERF=1 python -m pytest -q -m perf
 ```
 
-### HTTP rate limiting
+The normal test suite covers certificate creation, chain validation, expired certificate handling, wrong EKU/purpose handling, malformed inputs, CRL, OCSP, repository endpoints, audit tamper detection, policy violations, CT logging, compromise simulation, TLS integration, and code signing. The performance test is isolated and skipped from normal runs because it intentionally issues and validates 1000 certificates.
 
-`repo serve` and `ocsp serve` support per-client-IP token-bucket rate limiting. When a client exceeds the limit, the server returns HTTP `429 Too Many Requests` and a `Retry-After` header.
+## CI
+
+A GitHub Actions workflow is included in `.github/workflows/ci.yml`. It installs dependencies and runs the normal test suite on pushes and pull requests.
+
+## Security considerations
+
+MicroPKI is educational software and is not production-ready without additional hardening.
+
+- End-entity private keys are stored unencrypted by default. Treat generated `*.key.pem` files as secrets.
+- Root and Intermediate CA private keys are encrypted, but passphrases are read from files. Protect passphrase files and remove them from shared systems.
+- The repository and OCSP responder use HTTP, not HTTPS, unless placed behind a TLS reverse proxy.
+- Rate limiting is a local per-IP token bucket; it does not stop distributed attacks.
+- The audit log is tamper-evident through a hash chain but is not externally signed or anchored.
+- CT is only simulated with a plain text append-only file. It has no Merkle tree, inclusion proof, or public gossip protocol.
+- Root/Intermediate lifecycle management, key ceremonies, HSM storage, backup, disaster recovery, and certificate profiles are simplified for coursework.
+
+## Release
+
+The final deliverable version is `v1.0.0` in `pyproject.toml`. After committing the repository, create and push the tag:
 
 ```bash
-micropki repo serve \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --rate-limit 5 \
-  --rate-burst 10
+git tag -a v1.0.0 -m "MicroPKI Sprint 8 final deliverable"
+git push origin main --tags
 ```
 
-```bash
-micropki ocsp serve \
-  --host 0.0.0.0 \
-  --port 8081 \
-  --db-path ./pki/micropki.db \
-  --responder-cert ./pki/certs/ocsp.cert.pem \
-  --responder-key ./pki/certs/ocsp.key.pem \
-  --ca-cert ./pki/certs/intermediate.cert.pem \
-  --rate-limit 10 \
-  --rate-burst 20
-```
+## References
 
-### Configuration file
-
-A sample `micropki.toml` is included. The CLI accepts a global `--config` argument before the command name:
-
-```bash
-micropki --config ./micropki.toml repo serve --host 0.0.0.0 --port 8080
-```
-
-Supported configuration sections are `audit`, `rate_limit`, `transparency` and `policy`. The current implementation applies audit paths, CT log path and rate-limit defaults; mandatory policy checks remain enforced in code so unsafe defaults cannot silently weaken the CA.
-
-Example:
-
-```toml
-[audit]
-log_file = "./pki/audit/audit.log"
-chain_file = "./pki/audit/chain.dat"
-
-[rate_limit]
-requests_per_second = 5
-burst = 10
-
-[transparency]
-ct_log = "./pki/audit/ct.log"
-
-[policy]
-max_root_validity_days = 3650
-max_intermediate_validity_days = 1825
-max_end_entity_validity_days = 365
-reject_wildcards = true
-```
-
-### Sprint 7 tests
-
-The Sprint 7 test suite covers audit hash-chain tamper detection, audit filtering, validity and wildcard policy rejection, CT log inclusion, compromise tracking and blocking, and repository rate limiting.
-
-```bash
-pytest tests/test_sprint7.py
-```
+- RFC 5280: Internet X.509 Public Key Infrastructure Certificate and CRL Profile.
+- RFC 6960: Online Certificate Status Protocol.
+- Python `cryptography` package documentation.
+- Python `ssl`, `http.server`, and `sqlite3` standard-library documentation.

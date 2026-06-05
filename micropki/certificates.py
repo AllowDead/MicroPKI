@@ -57,7 +57,22 @@ def _authority_key_identifier_from_cert(issuer_cert):
         return x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_cert.public_key())
 
 
-def build_ca_certificate(subject_name, private_key, validity_days, serial_number=None):
+def build_ca_certificate(subject_name, private_key, validity_days, serial_number=None, aki_critical=True):
+    """Build a self-signed Root CA certificate.
+
+    Parameters:
+        subject_name: X.509 subject and issuer name for the self-signed CA.
+        private_key: Private key used as both subject key and signing key.
+        validity_days: Certificate validity period in days.
+        serial_number: Optional explicit serial number.
+        aki_critical: Whether Authority Key Identifier is marked critical.
+            The default remains True for compatibility with the Sprint 1-6 unit
+            tests and the original course profile. CLI/demo-generated roots pass
+            False because real TLS stacks reject unknown critical extensions.
+
+    Returns:
+        A signed x509.Certificate object.
+    """
     public_key = private_key.public_key()
     subject = subject_name
     issuer = subject_name
@@ -93,7 +108,7 @@ def build_ca_certificate(subject_name, private_key, validity_days, serial_number
     builder = builder.add_extension(ski, critical=False)
     builder = builder.add_extension(
         x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski),
-        critical=True,
+        critical=aki_critical,
     )
 
     return builder.sign(private_key, _signing_hash_for_key(private_key))

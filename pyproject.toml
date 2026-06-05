@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "micropki"
-version = "0.1.0"
+version = "1.0.0"
 description = "MicroPKI Utility - Инфраструктура открытых ключей"
 requires-python = ">=3.8"
 dependencies = [
@@ -14,7 +14,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
 [project.scripts]
 micropki = "micropki.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "perf: slow performance tests that issue or validate large certificate batches",
+]

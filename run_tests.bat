@@ -1,2 +1,2 @@
 @echo off
-python -m pytest -q
+python -m pytest -v -k "not perf"

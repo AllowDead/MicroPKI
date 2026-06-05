@@ -152,7 +152,7 @@ def init_ca(args, logger):
         if getattr(args, "db_path", None):
             from .serial import generate_unique_serial
             serial_number = generate_unique_serial(args.db_path)
-        cert = build_ca_certificate(dn, private_key, validity_days, serial_number=serial_number)
+        cert = build_ca_certificate(dn, private_key, validity_days, serial_number=serial_number, aki_critical=False)
     except ValueError as exc:
         logger.error(f"Ошибка формирования сертификата: {exc}")
         raise SystemExit(1)

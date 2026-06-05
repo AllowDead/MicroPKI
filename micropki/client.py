@@ -94,3 +94,91 @@ def format_validation_result(result, fmt: str = "text") -> str:
     if fmt == "json":
         return json.dumps(result.to_dict(), indent=2)
     return result.to_text()
+
+
+def sign_file(input_path: str, key_path: str, signature_path: str, passphrase: bytes | None = None, logger=None) -> str:
+    """Create a detached SHA-256 signature for a file.
+
+    RSA keys use PKCS#1 v1.5 with SHA-256. EC keys use ECDSA with SHA-256.
+    The signature is written as raw binary bytes so it can be stored beside any
+    script or executable used in the Sprint 8 code-signing demonstration.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+    with open(input_path, "rb") as f:
+        data = f.read()
+    with open(key_path, "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=passphrase)
+
+    if isinstance(key, rsa.RSAPrivateKey):
+        signature = key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+    elif isinstance(key, ec.EllipticCurvePrivateKey):
+        signature = key.sign(data, ec.ECDSA(hashes.SHA256()))
+    else:
+        raise ValueError("Unsupported private key type for code signing")
+
+    os.makedirs(os.path.dirname(os.path.abspath(signature_path)) or ".", exist_ok=True)
+    with open(signature_path, "wb") as f:
+        f.write(signature)
+    if logger:
+        logger.info(f"Code-signing signature written: {os.path.abspath(signature_path)}")
+    return signature_path
+
+
+def verify_file_signature(
+    input_path: str,
+    signature_path: str,
+    cert_path: str,
+    trusted_path: str,
+    untrusted_paths: list[str] | None = None,
+    crl: str | None = None,
+    issuer_cert_path: str | None = None,
+    logger=None,
+) -> bool:
+    """Verify a detached signature and the code-signing certificate chain.
+
+    The certificate must validate to the supplied trust anchor and must contain
+    the Code Signing EKU. If a CRL path/URL and issuer certificate are supplied,
+    the signer certificate must also be non-revoked.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+    result = validate_certificate_chain(cert_path, untrusted_paths or [], trusted_path, purpose="code_signing")
+    if not result.ok:
+        if logger:
+            logger.error(f"Code-signing certificate validation failed: {result.error}")
+        return False
+
+    if crl:
+        issuer_path = issuer_cert_path or (untrusted_paths or [None])[0]
+        if not issuer_path:
+            if logger:
+                logger.error("CRL verification requires an issuer certificate")
+            return False
+        status = check_certificate_status(cert_path, issuer_path, crl=crl, logger=logger)
+        if status.status != "good":
+            if logger:
+                logger.error(f"Code-signing certificate revocation check failed: {status.status}")
+            return False
+
+    with open(input_path, "rb") as f:
+        data = f.read()
+    with open(signature_path, "rb") as f:
+        signature = f.read()
+    cert = load_certificate(cert_path)
+    public_key = cert.public_key()
+
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(signature, data, padding.PKCS1v15(), hashes.SHA256())
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
+        else:
+            raise ValueError("Unsupported public key type for code-signing verification")
+    except Exception as exc:
+        if logger:
+            logger.error(f"Detached signature verification failed: {exc}")
+        return False
+    if logger:
+        logger.info(f"Detached signature verified: {os.path.abspath(input_path)}")
+    return True

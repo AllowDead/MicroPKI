@@ -604,6 +604,24 @@ def main():
     check_status_parser.add_argument("--ocsp-url", help="OCSP responder URL override")
     check_status_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
 
+
+    sign_parser = client_subparsers.add_parser("sign", help="Create a detached code-signing signature for a file")
+    sign_parser.add_argument("--input", required=True, help="File to sign")
+    sign_parser.add_argument("--key", required=True, help="Code-signing private key PEM")
+    sign_parser.add_argument("--signature", required=True, help="Output detached signature path")
+    sign_parser.add_argument("--key-pass-file", help="Optional passphrase file for encrypted signing key")
+    sign_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
+    verify_sig_parser = client_subparsers.add_parser("verify-signature", help="Verify a detached code-signing signature and signer certificate chain")
+    verify_sig_parser.add_argument("--input", required=True, help="Signed file path")
+    verify_sig_parser.add_argument("--signature", required=True, help="Detached signature path")
+    verify_sig_parser.add_argument("--cert", required=True, help="Code-signing certificate PEM")
+    verify_sig_parser.add_argument("--trusted", required=True, help="Trusted Root CA PEM bundle")
+    verify_sig_parser.add_argument("--untrusted", action="append", default=[], help="Intermediate certificate PEM; can be repeated")
+    verify_sig_parser.add_argument("--crl", help="Optional CRL file or URL for signer revocation check")
+    verify_sig_parser.add_argument("--issuer-cert", help="Issuer CA certificate for CRL check; defaults to first --untrusted")
+    verify_sig_parser.add_argument("--log-file", help="Path to log file (default: stderr)")
+
     args = parser.parse_args()
     try:
         from .config import apply_config
@@ -906,6 +924,63 @@ def main():
             print(f"OCSP responder failed: {exc}", file=sys.stderr)
             sys.exit(1)
         return
+
+
+    if args.command == "client" and args.client_command == "sign":
+        from .logger import setup_logger
+        from .client import sign_file
+        logger = setup_logger(args.log_file)
+        errors = []
+        _validate_existing_readable_file(args.input, "--input", errors)
+        _validate_existing_readable_file(args.key, "--key", errors)
+        if args.key_pass_file:
+            _validate_existing_readable_file(args.key_pass_file, "--key-pass-file", errors)
+        sig_parent = os.path.dirname(os.path.abspath(args.signature)) or "."
+        if os.path.exists(sig_parent) and not _is_writable_directory(sig_parent):
+            errors.append(f"Директория для --signature недоступна для записи: {sig_parent}")
+        if errors:
+            for err in errors:
+                logger.error(err)
+            sys.exit(1)
+        passphrase = load_passphrase(args.key_pass_file) if args.key_pass_file else None
+        try:
+            out = sign_file(args.input, args.key, args.signature, passphrase=passphrase, logger=logger)
+            print(f"Signature: {out}")
+        except Exception as exc:
+            logger.error(f"Signing failed: {exc}")
+            print(f"Signing failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "client" and args.client_command == "verify-signature":
+        from .logger import setup_logger
+        from .client import verify_file_signature
+        logger = setup_logger(args.log_file)
+        errors = []
+        for path, name in [(args.input, "--input"), (args.signature, "--signature"), (args.cert, "--cert"), (args.trusted, "--trusted")]:
+            _validate_existing_readable_file(path, name, errors)
+        for path in args.untrusted or []:
+            _validate_existing_readable_file(path, "--untrusted", errors)
+        if args.crl and not (args.crl.startswith("http://") or args.crl.startswith("https://")):
+            _validate_existing_readable_file(args.crl, "--crl", errors)
+        if args.issuer_cert:
+            _validate_existing_readable_file(args.issuer_cert, "--issuer-cert", errors)
+        if errors:
+            for err in errors:
+                logger.error(err)
+            sys.exit(1)
+        ok = verify_file_signature(
+            args.input,
+            args.signature,
+            args.cert,
+            args.trusted,
+            args.untrusted,
+            crl=args.crl,
+            issuer_cert_path=args.issuer_cert,
+            logger=logger,
+        )
+        print("Signature: OK" if ok else "Signature: FAILED")
+        sys.exit(0 if ok else 1)
 
     if args.command == "client" and args.client_command == "gen-csr":
         from .logger import setup_logger

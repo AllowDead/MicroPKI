@@ -8,20 +8,28 @@ venv/
 .env
 .pytest_cache/
 
-# Артефакты сборки
+# Build artifacts
 micropki.egg-info/
 dist/
 build/
 .coverage
+coverage.json
 htmlcov/
 
-# PKI Артефакты
+# Generated PKI artifacts
 pki/
+demo/_work/
 *.pem
 *.key
 *.cert
+*.csr
+*.crl
+*.db
+*.sqlite
+chain.dat
+ct.log
 
-# Конфиденциальные данные и логи
+# Sensitive data and logs
 secrets/
 logs/
 *.log

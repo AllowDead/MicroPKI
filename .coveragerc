@@ -1,0 +1,9 @@
+[run]
+source = micropki
+omit =
+    micropki/__main__.py
+    micropki/config.py
+
+[report]
+show_missing = True
+skip_covered = False

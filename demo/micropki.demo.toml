@@ -1,0 +1,12 @@
+[audit]
+log_file = "./pki/audit/audit.log"
+chain_file = "./pki/audit/chain.dat"
+ct_log = "./pki/audit/ct.log"
+
+[policy]
+max_leaf_validity_days = 365
+reject_wildcards = true
+
+[rate_limit]
+requests_per_second = 10
+burst = 20
